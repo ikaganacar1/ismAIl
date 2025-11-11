@@ -1,0 +1,228 @@
+import torch
+import tiktoken
+from model import Transformer, ModelArgs
+
+
+#####################################
+# TEXT GENERATION FUNCTIONS
+#####################################
+
+def generate_text_simple(model, idx, max_new_tokens, context_size):
+    """
+    Generate text using simple greedy decoding (argmax).
+
+    Args:
+        model: The transformer model
+        idx: Input token indices of shape (batch_size, seq_len)
+        max_new_tokens: Number of new tokens to generate
+        context_size: Maximum context size the model can handle
+
+    Returns:
+        Generated token indices of shape (batch_size, seq_len + max_new_tokens)
+    """
+    # idx is (B, T) array of indices in the current context
+    for _ in range(max_new_tokens):
+        # Crop current context if it exceeds the supported context size
+        # E.g., if LLM supports only 5 tokens, and the context size is 10
+        # then only the last 5 tokens are used as context
+        idx_cond = idx[:, -context_size:]
+
+        # Get the predictions
+        with torch.no_grad():
+            logits = model(idx_cond)
+
+        # Focus only on the last time step
+        # (batch, n_token, vocab_size) becomes (batch, vocab_size)
+        logits = logits[:, -1, :]
+
+        # Get the idx of the vocab entry with the highest logits value
+        idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch, 1)
+
+        # Append sampled index to the running sequence
+        idx = torch.cat((idx, idx_next), dim=1)  # (batch, n_tokens+1)
+
+    return idx
+
+
+def generate_text_with_sampling(model, idx, max_new_tokens, context_size, temperature=1.0, top_k=None):
+    """
+    Generate text using sampling with temperature and optional top-k filtering.
+
+    Args:
+        model: The transformer model
+        idx: Input token indices of shape (batch_size, seq_len)
+        max_new_tokens: Number of new tokens to generate
+        context_size: Maximum context size the model can handle
+        temperature: Sampling temperature (higher = more random, lower = more deterministic)
+        top_k: If set, only sample from the top k most likely tokens
+
+    Returns:
+        Generated token indices of shape (batch_size, seq_len + max_new_tokens)
+    """
+    for _ in range(max_new_tokens):
+        # Crop current context if it exceeds the supported context size
+        idx_cond = idx[:, -context_size:]
+
+        # Get the predictions
+        with torch.no_grad():
+            logits = model(idx_cond)
+
+        # Focus only on the last time step
+        logits = logits[:, -1, :] / temperature
+
+        # Optional: apply top-k filtering
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = -float('Inf')
+
+        # Apply softmax to get probabilities
+        probs = torch.softmax(logits, dim=-1)
+
+        # Sample from the distribution
+        idx_next = torch.multinomial(probs, num_samples=1)
+
+        # Append sampled index to the running sequence
+        idx = torch.cat((idx, idx_next), dim=1)
+
+    return idx
+
+
+def text_to_token_ids(text, tokenizer):
+    """
+    Convert text to token IDs.
+
+    Args:
+        text: Input text string
+        tokenizer: Tokenizer instance
+
+    Returns:
+        Tensor of token IDs with shape (1, seq_len)
+    """
+    encoded = tokenizer.encode(text, allowed_special={"<|endoftext|>"})
+    encoded_tensor = torch.tensor(encoded).unsqueeze(0)
+    return encoded_tensor
+
+
+def token_ids_to_text(token_ids, tokenizer):
+    """
+    Convert token IDs to text.
+
+    Args:
+        token_ids: Tensor of token IDs, can be 1D or 2D
+        tokenizer: Tokenizer instance
+
+    Returns:
+        Decoded text string
+    """
+    # Handle both 1D and 2D tensors
+    if token_ids.dim() == 2:
+        token_ids = token_ids.squeeze(0)
+
+    # Convert to list and decode
+    flat = token_ids.tolist()
+    return tokenizer.decode(flat)
+
+
+#####################################
+# EXAMPLE USAGE
+#####################################
+
+if __name__ == "__main__":
+    # Example configuration - smaller model for testing
+    args = ModelArgs(
+        max_batch_size=4,
+        max_seq_len=1024,
+        vocab_size=50257,  # GPT-2 vocab size
+        dim=768,
+        inter_dim=3072,
+        moe_inter_dim=768,
+        n_layers=12,
+        n_dense_layers=1,
+        n_heads=12,
+        n_routed_experts=8,
+        n_shared_experts=2,
+        n_activated_experts=2,
+        kv_lora_rank=256,
+        qk_nope_head_dim=64,
+        qk_rope_head_dim=32,
+        v_head_dim=64,
+    )
+
+    # Initialize model and tokenizer
+    print("Initializing model...")
+    torch.manual_seed(123)
+    model = Transformer(args)
+    model.eval()
+
+    tokenizer = tiktoken.get_encoding("gpt2")
+
+    # Example 1: Greedy generation (argmax)
+    print(f"\n{'='*60}")
+    print("EXAMPLE 1: GREEDY GENERATION (ARGMAX)")
+    print(f"{'='*60}")
+
+    start_context = "Hello, I am"
+    print(f"\nInput: '{start_context}'")
+
+    token_ids = text_to_token_ids(start_context, tokenizer)
+    print(f"Token IDs shape: {token_ids.shape}")
+
+    generated_ids = generate_text_simple(
+        model=model,
+        idx=token_ids,
+        max_new_tokens=20,
+        context_size=args.max_seq_len
+    )
+
+    generated_text = token_ids_to_text(generated_ids, tokenizer)
+    print(f"\nGenerated: '{generated_text}'")
+    print(f"Total tokens: {generated_ids.shape[1]}")
+
+    # Example 2: Sampling with temperature
+    print(f"\n{'='*60}")
+    print("EXAMPLE 2: SAMPLING WITH TEMPERATURE")
+    print(f"{'='*60}")
+
+    start_context = "Once upon a time"
+    print(f"\nInput: '{start_context}'")
+
+    token_ids = text_to_token_ids(start_context, tokenizer)
+
+    # Generate with different temperatures
+    for temp in [0.5, 1.0, 1.5]:
+        print(f"\n--- Temperature: {temp} ---")
+        generated_ids = generate_text_with_sampling(
+            model=model,
+            idx=token_ids.clone(),
+            max_new_tokens=20,
+            context_size=args.max_seq_len,
+            temperature=temp
+        )
+        generated_text = token_ids_to_text(generated_ids, tokenizer)
+        print(f"Generated: '{generated_text}'")
+
+    # Example 3: Top-k sampling
+    print(f"\n{'='*60}")
+    print("EXAMPLE 3: TOP-K SAMPLING")
+    print(f"{'='*60}")
+
+    start_context = "The future of AI is"
+    print(f"\nInput: '{start_context}'")
+
+    token_ids = text_to_token_ids(start_context, tokenizer)
+
+    generated_ids = generate_text_with_sampling(
+        model=model,
+        idx=token_ids,
+        max_new_tokens=30,
+        context_size=args.max_seq_len,
+        temperature=0.8,
+        top_k=50
+    )
+
+    generated_text = token_ids_to_text(generated_ids, tokenizer)
+    print(f"Generated: '{generated_text}'")
+
+    print(f"\n{'='*60}")
+    print("Generation examples completed!")
+    print(f"{'='*60}\n")

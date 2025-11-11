@@ -36,6 +36,7 @@ class ModelArgs:
     n_limited_groups: int = 1
     score_func: Literal["softmax", "sigmoid"] = "softmax"
     route_scale: float = 1.
+    use_routing_bias: bool = False  # Enable routing bias for fine-tuning expert selection
     # mla
     q_lora_rank: int = 0
     kv_lora_rank: int = 512
@@ -60,10 +61,15 @@ gemm_impl: Literal["bf16", "fp8"] = "bf16"
 #####################################
 # DATA
 #####################################
-class Dataset(Dataset):
-    def __init__(self, txt, tokenizer, max_length, stride):
+class TextDataset(Dataset):
+    def __init__(self, txt, tokenizer, args: ModelArgs, stride: Optional[int] = None):
         self.input_ids = []
         self.target_ids = []
+
+        # Use max_seq_len from ModelArgs
+        max_length = args.max_seq_len
+        if stride is None:
+            stride = max_length // 2  # Default stride is half the sequence length
 
         # Tokenize the entire text
         token_ids = tokenizer.encode(txt, allowed_special={"<|endoftext|>"})
@@ -82,17 +88,22 @@ class Dataset(Dataset):
         return self.input_ids[idx], self.target_ids[idx]
 
 
-def create_dataloader(txt, batch_size=4, max_length=256,
-                         stride=128, shuffle=True, drop_last=True, num_workers=0):
+def create_dataloader(txt, args: ModelArgs, stride: Optional[int] = None,
+                         shuffle: bool = True, drop_last: bool = True, num_workers: int = 0):
     # Initialize the tokenizer
     tokenizer = tiktoken.get_encoding("gpt2")
 
-    # Create dataset
-    dataset = Dataset(txt, tokenizer, max_length, stride)
+    # Create dataset with ModelArgs
+    dataset = TextDataset(txt, tokenizer, args, stride)
 
-    # Create dataloader
+    # Create dataloader using batch_size from ModelArgs
     dataloader = DataLoader(
-        dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last, num_workers=num_workers)
+        dataset,
+        batch_size=args.max_batch_size,
+        shuffle=shuffle,
+        drop_last=drop_last,
+        num_workers=num_workers
+    )
 
     return dataloader
 
@@ -303,87 +314,133 @@ class MultiHeadLatentAttention(nn.Module):
 # MOE FEEDFORWARD
 #####################################
 
-class MoEFeedForward(nn.Module):
-    """
-    Mixture of Experts Feed-Forward Network using custom Linear modules.
-    Based on the architecture from gpt_with_kv_moe.py but adapted to use
-    the custom Linear, ColumnParallelLinear, and RowParallelLinear classes.
-    """
+class Gate(nn.Module):
+
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.num_experts_per_tok = args.n_activated_experts
-        self.num_experts = args.n_routed_experts
-        self.emb_dim = args.dim
-        self.hidden_dim = args.moe_inter_dim
+        self.dim = args.dim
+        self.n_routed_experts = args.n_routed_experts
+        self.n_activated_experts = args.n_activated_experts
+        self.n_expert_groups = args.n_expert_groups
+        self.n_limited_groups = args.n_limited_groups
+        self.score_func = args.score_func
+        self.route_scale = args.route_scale
 
-        # Gate network uses custom Linear
-        self.gate = Linear(args.dim, args.n_routed_experts, bias=False)
+        # Gate weight
+        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
 
-        # Expert networks using custom Linear modules
-        # fc1 and fc2 are the two input projections (for SwiGLU-style activation)
-        # fc3 is the output projection
-        self.fc1 = nn.ModuleList(
-            [
-                Linear(args.dim, args.moe_inter_dim, bias=False)
-                for _ in range(self.num_experts)
-            ]
-        )
-        self.fc2 = nn.ModuleList(
-            [
-                Linear(args.dim, args.moe_inter_dim, bias=False)
-                for _ in range(self.num_experts)
-            ]
-        )
-        self.fc3 = nn.ModuleList(
-            [
-                Linear(args.moe_inter_dim, args.dim, bias=False)
-                for _ in range(self.num_experts)
-            ]
-        )
+        # Optional routing bias for fine-tuning expert selection
+        if args.use_routing_bias:
+            self.bias = nn.Parameter(torch.zeros(args.n_routed_experts, dtype=torch.float32))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        # Compute routing scores
+        scores = linear(x, self.weight)
+
+        # Apply scoring function
+        if self.score_func == "softmax":
+            scores = scores.softmax(dim=-1, dtype=torch.float32)
+        else:
+            scores = scores.sigmoid()
+
+        original_scores = scores
+
+        # Apply routing bias if available
+        if self.bias is not None:
+            scores = scores + self.bias
+
+        # Expert grouping for load balancing
+        if self.n_expert_groups > 1:
+            scores = scores.view(x.size(0), self.n_expert_groups, -1)
+            if self.bias is None:
+                group_scores = scores.amax(dim=-1)
+            else:
+                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+            indices = group_scores.topk(self.n_limited_groups, dim=-1)[1]
+            mask = scores.new_ones(x.size(0), self.n_expert_groups, dtype=bool).scatter_(1, indices, False)
+            scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
+
+        # Select top-k experts
+        indices = torch.topk(scores, self.n_activated_experts, dim=-1)[1]
+        weights = original_scores.gather(1, indices)
+
+        # Normalize weights if using sigmoid
+        if self.score_func == "sigmoid":
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+
+        # Apply route scaling
+        weights = weights * self.route_scale
+
+        return weights.type_as(x), indices
+
+
+class Expert(nn.Module):
+
+    def __init__(self, dim: int, inter_dim: int):
+        super().__init__()
+        self.w1 = Linear(dim, inter_dim, bias=False)
+        self.w2 = Linear(inter_dim, dim, bias=False)
+        self.w3 = Linear(dim, inter_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, seq_len, emb_dim)
-        scores = self.gate(x)  # (b, seq_len, num_experts)
-        topk_scores, topk_indices = torch.topk(scores, self.num_experts_per_tok, dim=-1)
-        topk_probs = torch.softmax(topk_scores, dim=-1)
+        # SwiGLU activation: w2(silu(w1(x)) * w3(x))
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
-        batch, seq_len, _ = x.shape
-        x_flat = x.reshape(batch * seq_len, -1)
-        out_flat = torch.zeros(batch * seq_len, self.emb_dim, device=x.device, dtype=x.dtype)
 
-        topk_indices_flat = topk_indices.reshape(-1, self.num_experts_per_tok)
-        topk_probs_flat = topk_probs.reshape(-1, self.num_experts_per_tok)
+class MoE(nn.Module):
+    
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.dim = args.dim
+        self.n_routed_experts = args.n_routed_experts
+        self.n_activated_experts = args.n_activated_experts
 
-        unique_experts = torch.unique(topk_indices_flat)
+        # Gate for routing
+        self.gate = Gate(args)
 
-        for expert_id_tensor in unique_experts:
-            expert_id = int(expert_id_tensor.item())
+        # Routed experts
+        self.experts = nn.ModuleList([
+            Expert(args.dim, args.moe_inter_dim)
+            for _ in range(args.n_routed_experts)
+        ])
 
-            mask = topk_indices_flat == expert_id
-            if not mask.any():
+        # Shared experts (always process all tokens)
+        self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+        original_shape = x.size()
+        x = x.view(-1, self.dim)
+
+        # Route tokens to experts
+        weights, indices = self.gate(x)
+
+        # Initialize output for routed experts
+        y = torch.zeros_like(x)
+
+        # Process each routed expert
+        for i in range(self.n_routed_experts):
+            # Find tokens routed to this expert
+            idx, top = torch.where(indices == i)
+            if idx.numel() == 0:
                 continue
 
-            token_mask = mask.any(dim=-1)
-            selected_idx = token_mask.nonzero(as_tuple=False).squeeze(-1)
-            if selected_idx.numel() == 0:
-                continue
+            # Process tokens with this expert
+            expert_output = self.experts[i](x[idx])
 
-            expert_input = x_flat.index_select(0, selected_idx)
-            # SwiGLU-style activation: silu(fc1(x)) * fc2(x)
-            hidden = torch.nn.functional.silu(self.fc1[expert_id](expert_input)) * self.fc2[
-                expert_id
-            ](expert_input)
-            expert_out = self.fc3[expert_id](hidden)
+            # Weight and accumulate expert outputs
+            y[idx] += expert_output * weights[idx, top, None]
 
-            mask_selected = mask[selected_idx]
-            slot_indices = mask_selected.int().argmax(dim=-1, keepdim=True)
-            selected_probs = torch.gather(
-                topk_probs_flat.index_select(0, selected_idx), dim=-1, index=slot_indices
-            ).squeeze(-1)
+        # Process all tokens with shared experts
+        z = self.shared_experts(x)
 
-            out_flat.index_add_(0, selected_idx, expert_out * selected_probs.unsqueeze(-1))
+        # Combine routed and shared expert outputs
+        output = (y + z).view(original_shape)
 
-        return out_flat.reshape(batch, seq_len, self.emb_dim)
+        return output
 
 
 #####################################
@@ -391,10 +448,6 @@ class MoEFeedForward(nn.Module):
 #####################################
 
 class MLP(nn.Module):
-    """
-    Dense feed-forward network using custom Linear modules.
-    Used for dense layers (non-MoE layers).
-    """
     def __init__(self, dim: int, inter_dim: int):
         super().__init__()
         self.fc1 = Linear(dim, inter_dim, bias=False)
@@ -415,7 +468,7 @@ class Block(nn.Module):
         super().__init__()
         self.attn = MultiHeadLatentAttention(args)
         # Use dense MLP for first n_dense_layers, then MoE for remaining layers
-        self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoEFeedForward(args)
+        self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE(args)
         self.attn_norm = RMSNorm(args.dim)
         self.ffn_norm = RMSNorm(args.dim)
 
@@ -461,81 +514,3 @@ class Transformer(nn.Module):
         output = self.output(h)
         return output
 
-
-#####################################
-# GENERATION
-#####################################
-
-def generate_text_simple(model, idx, max_new_tokens, context_size):
-    # idx is (B, T) array of indices in the current context
-    for _ in range(max_new_tokens):
-
-        # Crop current context if it exceeds the supported context size
-        # E.g., if LLM supports only 5 tokens, and the context size is 10
-        # then only the last 5 tokens are used as context
-        idx_cond = idx[:, -context_size:]
-
-        # Get the predictions
-        with torch.no_grad():
-            logits = model(idx_cond)
-
-        # Focus only on the last time step
-        # (batch, n_token, vocab_size) becomes (batch, vocab_size)
-        logits = logits[:, -1, :]
-
-        # Get the idx of the vocab entry with the highest logits value
-        idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch, 1)
-
-        # Append sampled index to the running sequence
-        idx = torch.cat((idx, idx_next), dim=1)  # (batch, n_tokens+1)
-
-    return idx
-
-
-if __name__ == "__main__":
-    # Example configuration - similar to DeepSeek-V3 but smaller for testing
-    args = ModelArgs(
-        max_batch_size=4,
-        max_seq_len=1024,
-        vocab_size=50257,  # GPT-2 vocab size for compatibility
-        dim=768,
-        inter_dim=3072,
-        moe_inter_dim=768,
-        n_layers=12,
-        n_dense_layers=1,  # First layer is dense, rest are MoE
-        n_heads=12,
-        n_routed_experts=8,
-        n_shared_experts=2,
-        n_activated_experts=2,
-        kv_lora_rank=256,
-        qk_nope_head_dim=64,
-        qk_rope_head_dim=32,
-        v_head_dim=64,
-    )
-
-    torch.manual_seed(123)
-    model = Transformer(args)
-    model.eval()
-
-    start_context = "Hello, I am"
-    tokenizer = tiktoken.get_encoding("gpt2")
-    encoded = tokenizer.encode(start_context)
-    encoded_tensor = torch.tensor(encoded).unsqueeze(0)
-
-    print(f"\n{50*'='}\n{22*' '}IN\n{50*'='}")
-    print("\nInput text:", start_context)
-    print("Encoded input text:", encoded)
-    print("encoded_tensor.shape:", encoded_tensor.shape)
-
-    out = generate_text_simple(
-        model=model,
-        idx=encoded_tensor,
-        max_new_tokens=10,
-        context_size=args.max_seq_len
-    )
-    decoded_text = tokenizer.decode(out.squeeze(0).tolist())
-
-    print(f"\n\n{50*'='}\n{22*' '}OUT\n{50*'='}")
-    print("\nOutput:", out)
-    print("Output length:", len(out[0]))
-    print("Output text:", decoded_text)
