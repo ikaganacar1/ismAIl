@@ -140,7 +140,7 @@ def setup_model(config, device):
     print("="*70 + "\n")
     
     # Estimate size
-    size_info = estimate_model_size(args)
+    #size_info = estimate_model_size(args)
     
     model = ismail(args).to(device)
     
@@ -209,34 +209,38 @@ def get_lr(step, config):
 
 
 def load_data(config):
-    """Create data loaders"""
+    """Create data loaders with memory-efficient loading"""
     data_cfg = config["data"]
-    
+
     print("\n" + "="*70)
     print("DATA LOADING")
     print("="*70 + "\n")
-    
+
     from data import create_dataloader
-    
+
+    # FIXED: Pass file path directly instead of reading entire file into memory
+    # The create_dataloader will use MemoryEfficientTextDataset for lazy loading
     train_loader = create_dataloader(
-        txt=Path(data_cfg["train_file"]).read_text(encoding="utf-8"),
+        txt=str(data_cfg["train_file"]),  # Pass path, not file contents
         args=ModelArgs(**config["model"]),
         stride=data_cfg["stride"],
         shuffle=True,
         drop_last=True,
+        use_memory_efficient=True,  # Use memory-efficient loading
     )
-    
+
     val_loader = create_dataloader(
-        txt=Path(data_cfg["val_file"]).read_text(encoding="utf-8"),
+        txt=str(data_cfg["val_file"]),  # Pass path, not file contents
         args=ModelArgs(**config["model"]),
         stride=data_cfg["stride"],
         shuffle=False,
         drop_last=True,
+        use_memory_efficient=True,  # Use memory-efficient loading
     )
-    
+
     print(f"✅ Train batches: {len(train_loader)}")
     print(f"✅ Val batches: {len(val_loader)}\n")
-    
+
     return train_loader, val_loader
 
 
