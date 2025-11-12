@@ -27,6 +27,7 @@ def download_and_prepare_data(
     train_ratio: float = 0.90,
     seed: int = 2357,
     max_samples: int = None,
+    cache_dir: str = None,
 ):
 
     data_dir = Path(data_dir)
@@ -45,25 +46,27 @@ def download_and_prepare_data(
         else:
             # Try to find cached parquet files first
             import os
-            cache_dir = Path.home() / ".cache/huggingface/datasets/downloads"
 
             print(f"   Looking for cached parquet files...")
             parquet_files = []
 
-            if cache_dir.exists():
-                # Find all parquet files in cache
-                for root, dirs, files in os.walk(cache_dir):
-                    for file in files:
-                        if file.endswith('.parquet') and 'tr_part' in file:
-                            parquet_files.append(os.path.join(root, file))
+            # Use custom cache directory if provided, otherwise use default
+            if cache_dir:
+                search_paths = [Path(cache_dir)]
+            else:
+                search_paths = [
+                    Path.home() / ".cache/huggingface/datasets/downloads",
+                    Path.home() / ".cache/huggingface/datasets/uonlp___cultura_x",
+                ]
 
-            # Also check for extracted parquet files in the main cache directory
-            culturax_cache = Path.home() / ".cache/huggingface/datasets/uonlp___cultura_x"
-            if culturax_cache.exists():
-                for root, dirs, files in os.walk(culturax_cache):
-                    for file in files:
-                        if file.endswith('.parquet'):
-                            parquet_files.append(os.path.join(root, file))
+            for search_path in search_paths:
+                if search_path.exists():
+                    print(f"   Searching in: {search_path}")
+                    # Find all parquet files in cache
+                    for root, dirs, files in os.walk(search_path):
+                        for file in files:
+                            if file.endswith('.parquet'):
+                                parquet_files.append(os.path.join(root, file))
 
             if parquet_files:
                 # Use the cached parquet files
@@ -241,6 +244,11 @@ def main():
         type=int,
         help="Maximum number of samples to process (for testing)"
     )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        help="Custom cache directory path where parquet files are located"
+    )
 
     args = parser.parse_args()
 
@@ -262,6 +270,7 @@ def main():
         train_ratio=train_ratio,
         seed=args.seed,
         max_samples=args.max_samples,
+        cache_dir=args.cache_dir,
     )
 
 
