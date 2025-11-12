@@ -536,7 +536,7 @@ class ismail(nn.Module):
 
             if self.training and self.use_checkpointing:
                 from torch.utils.checkpoint import checkpoint
-                h, lb_loss = checkpoint(layer.checkpoint_forward, h)
+                h, lb_loss = checkpoint(layer.checkpoint_forward, h, use_reentrant=False )
             else:
                 h, lb_loss = layer(h, start_pos, freqs_cis, mask)
                 
