@@ -164,7 +164,7 @@ if __name__ == "__main__":
     from pathlib import Path
 
     # Configuration: Set to True to use Turkish tokenizer, False for tiktoken
-    USE_TURKISH_TOKENIZER = False  # Change this to True for Turkish text generation
+    USE_TURKISH_TOKENIZER = True  # Change this to False for English text generation
 
     # Example configuration - smaller model for testing
     config_path = Path("config.json")
@@ -179,15 +179,20 @@ if __name__ == "__main__":
 
     # Initialize tokenizer
     tokenizer_name = getattr(args, "tokenizer_name", "gpt2")
+    # Auto-detect Turkish tokenizer from config
+    use_turkish = (tokenizer_name.lower() == "turkish") or USE_TURKISH_TOKENIZER
+
     tokenizer = get_tokenizer(
-        use_turkish=USE_TURKISH_TOKENIZER,
-        tokenizer_name=tokenizer_name
+        use_turkish=use_turkish,
+        tokenizer_name="gpt2" if use_turkish else tokenizer_name
     )
 
     # Update vocab size if using Turkish tokenizer
-    if USE_TURKISH_TOKENIZER and isinstance(tokenizer, TurkishTokenizerWrapper):
-        args.vocab_size = tokenizer.n_vocab
-        print(f"📊 Updated vocab_size to {args.vocab_size:,} for Turkish tokenizer")
+    if use_turkish and isinstance(tokenizer, TurkishTokenizerWrapper):
+        if args.vocab_size != tokenizer.n_vocab:
+            print(f"⚠️  Config vocab_size ({args.vocab_size:,}) doesn't match tokenizer ({tokenizer.n_vocab:,})")
+            args.vocab_size = tokenizer.n_vocab
+            print(f"📊 Updated vocab_size to {args.vocab_size:,} for Turkish tokenizer")
 
     # Initialize model
     print("Initializing model...")

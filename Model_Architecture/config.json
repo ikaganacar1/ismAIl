@@ -4,7 +4,7 @@
         "max_seq_len": 2048,
         "dtype": "bf16",
         "scale_fmt": null,
-        "vocab_size": 102400,
+        "vocab_size": 32768,
         "dim": 1024,
         "inter_dim": 4096,
         "moe_inter_dim": 1024,
@@ -27,7 +27,7 @@
         "beta_fast": 32,
         "beta_slow": 1,
         "mscale": 1.0,
-        "tokenizer_name": "gpt2"
+        "tokenizer_name": "turkish"
     },
     "training": {
         "learning_rate": 3e-4,

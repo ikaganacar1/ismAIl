@@ -190,7 +190,8 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor):
-        return F.rms_norm(x, (self.dim,), self.weight, self.eps)
+        output = F.rms_norm(x, (self.dim,), self.weight, self.eps)
+        return output.to(x.dtype)
 
 
 #####################################
@@ -228,8 +229,8 @@ class MultiHeadLatentAttention(nn.Module):
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
 
-        self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank), persistent=False)
-        self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim), persistent=False)
+        self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank, dtype=Linear.dtype), persistent=False)
+        self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim, dtype=Linear.dtype), persistent=False)
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
 
@@ -280,7 +281,7 @@ class Gate(nn.Module):
         self.route_scale = args.route_scale
 
         # Gate weight
-        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
+        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim, dtype=Linear.dtype))
 
         # Optional routing bias for fine-tuning expert selection
         if args.use_routing_bias:
@@ -509,7 +510,7 @@ class ismail(nn.Module):
 
     def forward(self, tokens: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
         bsz, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)
+        h = self.tok_embeddings(tokens).to(Linear.dtype)
         freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
 
         # Create causal mask
