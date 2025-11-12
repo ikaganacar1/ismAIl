@@ -219,8 +219,19 @@ def estimate_model_size(args: ModelArgs):
 
 
 if __name__ == "__main__":
-    # Load default configuration
-    args = ModelArgs()
+    import json
+    from pathlib import Path
+
+    # Try to load from config.json, otherwise use defaults
+    config_path = Path(__file__).parent / "config.json"
+    if config_path.exists():
+        print(f"📄 Loading configuration from {config_path}")
+        with open(config_path) as f:
+            config = json.load(f)
+        args = ModelArgs(**config["model"])
+    else:
+        print("⚠️  config.json not found, using default ModelArgs")
+        args = ModelArgs()
 
     # Run estimation
     results = estimate_model_size(args)

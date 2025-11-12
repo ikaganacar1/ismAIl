@@ -31,29 +31,37 @@ except ImportError:
     HAS_BNB = False
     print("⚠️  bitsandbytes not installed. Run 'pip install bitsandbytes' for memory-efficient optimizer.")
 
-# Configuration
+# Configuration - matches ModelArgs defaults
 DEFAULT_CONFIG = {
     "model": {
-        "vocab_size": 32000,  # Reduced from 102400
+        "max_batch_size": 8,
+        "max_seq_len": 2048,
+        "dtype": "bf16",
+        "scale_fmt": None,
+        "vocab_size": 102400,
         "dim": 1024,
         "inter_dim": 4096,
         "moe_inter_dim": 1024,
-        "n_layers": 16,
-        "n_dense_layers": 1,  # Only first layer dense
-        "n_heads": 16,  # Increased for better parallelism
-        # MoE
+        "n_layers": 20,
+        "n_dense_layers": 3,
+        "n_heads": 12,
         "n_routed_experts": 6,
         "n_shared_experts": 1,
         "n_activated_experts": 2,
-        # MLA
-        "q_lora_rank": 128,  # Enable Q LoRA
+        "route_scale": 1.0,
+        "use_routing_bias": True,
+        "q_lora_rank": 0,
         "kv_lora_rank": 512,
-        "qk_nope_head_dim": 64,
-        "qk_rope_head_dim": 32,
-        "v_head_dim": 64,
-        # Sequence
-        "max_seq_len": 2048,  # Start shorter
-        "max_batch_size": 4,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "original_seq_len": 4096,
+        "rope_theta": 10000.0,
+        "rope_factor": 40,
+        "beta_fast": 32,
+        "beta_slow": 1,
+        "mscale": 1.0,
+        "tokenizer_name": "gpt2",
     },
     "training": {
         "learning_rate": 3e-4,
@@ -237,22 +245,25 @@ def evaluate(model, val_loader, device, config):
     model.eval()
     total_loss = 0.0
     total_tokens = 0
-    
+
     with torch.no_grad():
         for input_ids, target_ids in val_loader:
             input_ids = input_ids.to(device)
             target_ids = target_ids.to(device)
-            
-            logits, lb_loss = model(input_ids, start_pos=0)
+
+            # Model returns just logits in eval mode (no lb_loss)
+            output = model(input_ids, start_pos=0)
+            logits = output if not isinstance(output, tuple) else output[0]
+
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 target_ids.view(-1),
                 ignore_index=-1,
             )
-            
+
             total_loss += loss.item() * target_ids.numel()
             total_tokens += target_ids.numel()
-    
+
     model.train()
     return total_loss / total_tokens
 
@@ -286,22 +297,29 @@ def train_step(model, batch, device, config, scaler=None):
     input_ids, target_ids = batch
     input_ids = input_ids.to(device, non_blocking=True)
     target_ids = target_ids.to(device, non_blocking=True)
-    
+
     # Forward pass
     with torch.cuda.amp.autocast(enabled=(config["training"]["dtype"] == "bf16")):
-        logits, lb_loss = model(input_ids, start_pos=0)
-        
+        output = model(input_ids, start_pos=0)
+
+        # Handle model output (tuple in training mode with MoE, single tensor otherwise)
+        if isinstance(output, tuple):
+            logits, lb_loss = output
+        else:
+            logits = output
+            lb_loss = 0.0
+
         # Main language modeling loss
         lm_loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
             target_ids.view(-1),
             ignore_index=-1,
         )
-        
+
         # Total loss with load balancing
         total_loss = lm_loss + config["training"].get("lb_loss_coef", 0.01) * lb_loss
-    
-    return total_loss, lm_loss, lb_loss
+
+    return total_loss, lm_loss, lb_loss if isinstance(lb_loss, float) else lb_loss.item()
 
 
 def main():

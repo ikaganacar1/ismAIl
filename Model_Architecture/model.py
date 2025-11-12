@@ -52,6 +52,8 @@ class ModelArgs:
     beta_slow: int = 1
     mscale: float = 1.
 
+    tokenizer_name: str = "gpt2"  #
+
 # others
 world_size = 1
 rank = 0
@@ -304,9 +306,8 @@ class Gate(nn.Module):
         indices = torch.topk(scores, self.n_activated_experts, dim=-1)[1]
         weights = original_scores.gather(1, indices)
 
-        # Normalize weights if using sigmoid
-        if self.score_func == "sigmoid":
-            weights = weights / weights.sum(dim=-1, keepdim=True)
+        # Normalize weights (sigmoid always needs normalization)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
 
         # Apply route scaling
         weights = weights * self.route_scale
@@ -387,10 +388,9 @@ class MoE(nn.Module):
             
         # Select top-k experts
         weights, indices = torch.topk(router_probs, self.n_activated_experts, dim=-1)
-        
-        # Normalize weights
-        if self.gate.score_func == "sigmoid":
-            weights = weights / weights.sum(dim=-1, keepdim=True)
+
+        # Normalize weights (sigmoid always needs normalization)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
         weights = weights * self.gate.route_scale
         
         # Sequential Training Mode
@@ -468,10 +468,19 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm(args.dim)
         self.ffn_norm = RMSNorm(args.dim)
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x = x + self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
-        x = x + self.ffn(self.ffn_norm(x))
-        return x
+
+        # Handle both MLP (returns single output) and MoE (returns output + loss)
+        ffn_result = self.ffn(self.ffn_norm(x))
+        if isinstance(ffn_result, tuple):
+            ffn_out, lb_loss = ffn_result
+        else:
+            ffn_out = ffn_result
+            lb_loss = None
+
+        x = x + ffn_out
+        return x, lb_loss
 
 
 #####################################
@@ -492,6 +501,12 @@ class ismail(nn.Module):
 
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
 
+    def set_active_expert(self, expert_idx: Optional[int]):
+        """Set active expert for all MoE layers (for sequential training)"""
+        for layer in self.layers:
+            if isinstance(layer.ffn, MoE):
+                layer.ffn.set_active_expert(expert_idx)
+
     def forward(self, tokens: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
         bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
@@ -504,9 +519,17 @@ class ismail(nn.Module):
             mask = torch.triu(mask, diagonal=1)
             mask = torch.hstack([torch.zeros((seqlen, start_pos), device=tokens.device), mask]).type_as(h)
 
+        total_lb_loss = 0.0
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+            h, lb_loss = layer(h, start_pos, freqs_cis, mask)
+            if lb_loss is not None:
+                total_lb_loss += lb_loss
+
         h = self.norm(h)
         output = self.output(h)
+
+        # Return output and total load balancing loss if training
+        if self.training and total_lb_loss > 0:
+            return output, total_lb_loss
         return output
 

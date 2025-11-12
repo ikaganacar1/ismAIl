@@ -1,0 +1,59 @@
+{
+    "model": {
+        "max_batch_size": 8,
+        "max_seq_len": 2048,
+        "dtype": "bf16",
+        "scale_fmt": null,
+        "vocab_size": 102400,
+        "dim": 1024,
+        "inter_dim": 4096,
+        "moe_inter_dim": 1024,
+        "n_layers": 20,
+        "n_dense_layers": 3,
+        "n_heads": 12,
+        "n_routed_experts": 6,
+        "n_shared_experts": 1,
+        "n_activated_experts": 2,
+        "route_scale": 1.0,
+        "use_routing_bias": true,
+        "q_lora_rank": 0,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "original_seq_len": 4096,
+        "rope_theta": 10000.0,
+        "rope_factor": 40,
+        "beta_fast": 32,
+        "beta_slow": 1,
+        "mscale": 1.0,
+        "tokenizer_name": "gpt2"
+    },
+    "training": {
+        "learning_rate": 3e-4,
+        "weight_decay": 0.1,
+        "beta1": 0.9,
+        "beta2": 0.95,
+        "grad_clip": 1.0,
+        "warmup_steps": 1000,
+        "total_steps": 50000,
+        "expert_rotation_steps": 2000,
+        "gradient_accumulation_steps": 16,
+        "eval_every": 1000,
+        "save_every": 5000,
+        "save_dir": "./checkpoints",
+        "log_every": 100,
+        "dtype": "bf16",
+        "compile": true
+    },
+    "data": {
+        "train_file": "./data/train.txt",
+        "val_file": "./data/val.txt",
+        "stride": 512
+    },
+    "logging": {
+        "use_wandb": true,
+        "project_name": "sequential-moe",
+        "run_name": "moe-12gb-gpu"
+    }
+}

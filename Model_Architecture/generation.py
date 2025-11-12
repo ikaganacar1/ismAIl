@@ -128,25 +128,20 @@ def token_ids_to_text(token_ids, tokenizer):
 #####################################
 
 if __name__ == "__main__":
+    import json
+    from pathlib import Path
+
     # Example configuration - smaller model for testing
-    args = ModelArgs(
-        max_batch_size=4,
-        max_seq_len=1024,
-        vocab_size=50257,  # GPT-2 vocab size
-        dim=768,
-        inter_dim=3072,
-        moe_inter_dim=768,
-        n_layers=12,
-        n_dense_layers=1,
-        n_heads=12,
-        n_routed_experts=8,
-        n_shared_experts=2,
-        n_activated_experts=2,
-        kv_lora_rank=256,
-        qk_nope_head_dim=64,
-        qk_rope_head_dim=32,
-        v_head_dim=64,
-    )
+    config_path = Path("config.json")
+    if config_path.exists():
+        with open(config_path) as f:
+            config = json.load(f)
+        print(f"✅ Loaded config from {config_path}")
+        args = ModelArgs(**config["model"])
+    else:
+        print("⚠️ config.json not found, using default ModelArgs")
+        args = ModelArgs()
+
 
     # Initialize model and tokenizer
     print("Initializing model...")
@@ -154,7 +149,8 @@ if __name__ == "__main__":
     model = ismail(args)
     model.eval()
 
-    tokenizer = tiktoken.get_encoding("gpt2")
+    tokenizer_name = getattr(args, "tokenizer_name", "gpt2")
+    tokenizer = tiktoken.get_encoding(tokenizer_name)
 
     # Example 1: Greedy generation (argmax)
     print(f"\n{'='*60}")
