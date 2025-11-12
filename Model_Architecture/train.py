@@ -324,8 +324,8 @@ def train_step(model, input_mb, target_mb, device, config, scaler=None):
             lb_loss_coef = config["training"].get("lb_loss_coef", 0.01)
             total_loss = (lm_loss + lb_loss_coef * lb_loss) / accum_steps
 
-    # Backward
-    if config["training"]["dtype"] == "bf16":
+    # ✅ FIXED: Check if scaler exists before using it
+    if scaler is not None:
         scaler.scale(total_loss).backward()
     else:
         total_loss.backward()
