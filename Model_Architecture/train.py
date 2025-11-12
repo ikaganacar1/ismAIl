@@ -146,10 +146,11 @@ def setup_model(config, device):
     # Estimate size
     #size_info = estimate_model_size(args)
 
-    use_checkpointing = config["training"].get("use_checkpointing", False)
-    model = ismail(args, use_checkpointing=use_checkpointing).to(device)
+    model = ismail(args).to(device)
 
-    if use_checkpointing:
+    if config["training"].get("use_checkpointing", True):
+        for layer in model.layers:
+            layer.forward = lambda *args, layer=layer: checkpoint(layer._forward, *args)
         print("✅ Gradient checkpointing enabled")
     
     # Compile for speed (PyTorch 2.0+)

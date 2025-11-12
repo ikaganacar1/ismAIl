@@ -495,12 +495,11 @@ class Block(nn.Module):
 #####################################
 
 class ismail(nn.Module):
-    def __init__(self, args: ModelArgs, use_checkpointing: bool = False):
+    def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
         self.vocab_size = args.vocab_size
         self.n_layers = args.n_layers
-        self.use_checkpointing = use_checkpointing
 
         self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
         self.layers = nn.ModuleList([Block(i, args) for i in range(args.n_layers)])
@@ -534,7 +533,7 @@ class ismail(nn.Module):
             layer.freqs_cis = freqs_cis
             layer.mask = mask
 
-            if self.training and self.use_checkpointing:
+            if self.training and True:  # Enable gradient checkpointing during training
                 from torch.utils.checkpoint import checkpoint
                 h, lb_loss = checkpoint(layer.checkpoint_forward, h)
             else:
