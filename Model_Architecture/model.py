@@ -394,29 +394,31 @@ class MoE(nn.Module):
         weights = weights / weights.sum(dim=-1, keepdim=True)
         weights = weights * self.gate.route_scale
         
-        # Sequential Training Mode
+        # Sequential Training Mode - MEMORY EFFICIENT
+        # ONLY compute forward pass for the active expert to save GPU memory
         if self.training and self.active_expert_idx is not None:
             y = torch.zeros_like(x)
-            
-            # Only compute gradients for active expert
-            for i in range(self.n_routed_experts):
-                idx, top = torch.where(indices == i)
-                if idx.numel() == 0:
-                    continue
-                
-                # Use gradient context manager
-                grad_context = nullcontext() if i == self.active_expert_idx else torch.no_grad()
-                
-                with grad_context:
-                    expert_out = self.experts[i](x[idx])
-                    y[idx] += expert_out * weights[idx, top, None]
-            
+
+            # Run forward pass ONLY for the active expert
+            i = self.active_expert_idx
+            idx, top = torch.where(indices == i)
+
+            if idx.numel() > 0:
+                # Only this expert gets gradients and forward pass
+                expert_out = self.experts[i](x[idx])
+                y[idx] = expert_out * weights[idx, top, None]
+
+            # Inactive experts: Skip forward pass entirely (save memory!)
+            # Note: This means the model output will be degraded during training,
+            # but it's acceptable since we're training experts sequentially.
+            # The shared experts + active expert still provide reasonable outputs.
+
             # Load balance loss (still needed for gate training)
             lb_loss = self.compute_load_balance_loss(router_probs, indices)
-            
-            # Shared experts always train
+
+            # Shared experts always train (provides baseline performance)
             z = self.shared_experts(x)
-            
+
             return (y + z).view(original_shape), lb_loss
         
         # Normal MoE Mode (inference or full training)
