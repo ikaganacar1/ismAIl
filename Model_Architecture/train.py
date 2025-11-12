@@ -368,8 +368,13 @@ def main():
         step = ckpt["step"]
         print(f"✅ Resumed from step {step}\n")
     
-    # Gradient scaler
-    scaler = torch.amp.GradScaler(device='cuda', enabled=(config["training"]["dtype"] == "bf16"))
+    # ✅ FIX: Only create scaler for FP16, not BF16
+    dtype_bf16 = config["training"]["dtype"] == "bf16"
+    if dtype_bf16:
+        scaler = None
+        print("⚠️  BF16 mode: Disabling GradScaler (not needed/supported)\n")
+    else:
+        scaler = torch.amp.GradScaler(device='cuda', enabled=True)
     
     # Expert rotation
     current_expert = 0
@@ -377,11 +382,10 @@ def main():
     model.set_active_expert(current_expert)
     print(f"🎯 Training expert {current_expert}/{model_args.n_routed_experts - 1}")
     
-    # ✅ DEFINE VARIABLES HERE - outside the loop
+    # Define variables
     accum_steps = config["training"]["gradient_accumulation_steps"]
     total_steps = config["training"]["total_steps"]
     grad_clip = config["training"]["grad_clip"]
-    dtype_bf16 = config["training"]["dtype"] == "bf16"
     
     print("\n" + "="*70)
     print("TRAINING STARTED")
@@ -389,7 +393,7 @@ def main():
     
     model.train()
     
-    # ✅ MAIN TRAINING LOOP
+    # MAIN TRAINING LOOP
     while step < total_steps:
         step_start = time.time()
         
@@ -407,7 +411,7 @@ def main():
             train_iter = iter(train_loader)
             batch = next(train_iter)
         
-        # ✅ SPLIT BATCH OUTSIDE ACCUMULATION LOOP
+        # Split batch
         input_ids, target_ids = batch
         batch_size = input_ids.size(0)
         micro_batch_size = batch_size // accum_steps
@@ -416,12 +420,12 @@ def main():
         lm_loss_accum = 0.0
         lb_loss_accum = 0.0
         
-        # ✅ GRADIENT ACCUMULATION LOOP
+        # Gradient accumulation loop
         for accum_step in range(accum_steps):
             # Calculate slice indices
             start_idx = micro_batch_size * accum_step
             
-            # Handle last micro-batch (includes remainder)
+            # Handle last micro-batch
             if accum_step == accum_steps - 1:
                 end_idx = batch_size
             else:
@@ -436,22 +440,25 @@ def main():
                 model, input_mb, target_mb, device, config, scaler
             )
             
-            # Accumulate losses (normalized by accum_steps)
+            # Accumulate losses
             lm_loss_accum += lm_loss / accum_steps
             lb_loss_accum += lb_loss / accum_steps
         
-        # Gradient clipping
+        # Gradient clipping (if enabled)
         if grad_clip > 0:
-            if dtype_bf16:
+            # Skip unscale for BF16
+            if not dtype_bf16:
                 scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         
-        # Optimizer step
+        # ✅ FIX: Conditional optimizer step
         if dtype_bf16:
+            # BF16: Direct step
+            optimizer.step()
+        else:
+            # FP16: Scaled step
             scaler.step(optimizer)
             scaler.update()
-        else:
-            optimizer.step()
         
         optimizer.zero_grad(set_to_none=True)
         
