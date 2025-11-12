@@ -7,8 +7,9 @@ Compatible with the ismail model training pipeline
 
 import argparse
 from pathlib import Path
-from datasets import load_dataset, DatasetDict
+from datasets import load_dataset, DatasetDict, Dataset
 from tqdm import tqdm
+from itertools import islice
 import json
 
 # Configuration
@@ -27,18 +28,6 @@ def download_and_prepare_data(
     seed: int = 2357,
     max_samples: int = None,
 ):
-    """
-    Download dataset from HuggingFace and prepare train/val splits
-
-    Args:
-        data_dir: Directory to save processed data
-        use_small: Use small dataset (single parquet) or full dataset
-        parquet_file: Path to local parquet file for small dataset
-        full_data_path: Path pattern for full dataset parquet files
-        train_ratio: Ratio of training data (1 - val_ratio)
-        seed: Random seed for reproducibility
-        max_samples: Maximum number of samples to process (None = all)
-    """
 
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -54,20 +43,65 @@ def download_and_prepare_data(
             print(f"   Using local file: {parquet_file}")
             dataset = load_dataset('parquet', data_files=parquet_file)
         else:
-            print(f"   Downloading from HuggingFace: {DATASET_NAME}/{SUBSET}")
-            print(f"   Note: This will download to HuggingFace cache (~/.cache/huggingface/)")
-            # Download single file from CulturaX Turkish subset
-            dataset = load_dataset(
-                DATASET_NAME,
-                SUBSET,
-                split="train",
-                streaming=False,  # Download to local cache
-            )
-            # Take subset for small data
-            if max_samples:
-                dataset = dataset.select(range(min(max_samples, len(dataset))))
-            # Convert to DatasetDict for consistency
-            dataset = DatasetDict({"train": dataset})
+            # Try to find cached parquet files first
+            import os
+            cache_dir = Path.home() / ".cache/huggingface/datasets/downloads"
+
+            print(f"   Looking for cached parquet files...")
+            parquet_files = []
+
+            if cache_dir.exists():
+                # Find all parquet files in cache
+                for root, dirs, files in os.walk(cache_dir):
+                    for file in files:
+                        if file.endswith('.parquet') and 'tr_part' in file:
+                            parquet_files.append(os.path.join(root, file))
+
+            # Also check for extracted parquet files in the main cache directory
+            culturax_cache = Path.home() / ".cache/huggingface/datasets/uonlp___cultura_x"
+            if culturax_cache.exists():
+                for root, dirs, files in os.walk(culturax_cache):
+                    for file in files:
+                        if file.endswith('.parquet'):
+                            parquet_files.append(os.path.join(root, file))
+
+            if parquet_files:
+                # Use the cached parquet files
+                parquet_files = sorted(parquet_files)[:2]  # Use first 2 cached files
+                print(f"   ✅ Found {len(parquet_files)} cached parquet file(s)")
+                for pf in parquet_files:
+                    print(f"      - {Path(pf).name}")
+
+                dataset = load_dataset('parquet', data_files=parquet_files)
+
+                # Limit samples if requested
+                if max_samples and max_samples < len(dataset['train']):
+                    print(f"   Limiting to {max_samples:,} samples...")
+                    dataset['train'] = dataset['train'].select(range(max_samples))
+            else:
+                # No cached files found, use streaming
+                print(f"   No cached files found. Using streaming mode...")
+                print(f"   Downloading from HuggingFace: {DATASET_NAME}/{SUBSET}")
+
+                dataset = load_dataset(
+                    DATASET_NAME,
+                    SUBSET,
+                    split="train",
+                    streaming=True,
+                )
+
+                # Take limited number of samples from stream
+                num_samples = max_samples if max_samples else 100_000
+                print(f"   Taking {num_samples:,} samples from stream...")
+
+                samples = []
+                for sample in tqdm(islice(dataset, num_samples), total=num_samples, desc="Downloading"):
+                    samples.append(sample)
+
+                dataset = Dataset.from_list(samples)
+                dataset = DatasetDict({"train": dataset})
+
+            print(f"   ✅ Loaded {len(dataset['train']):,} samples")
     else:
         print(f"📥 Loading full dataset from: {full_data_path or 'HuggingFace'}")
         if full_data_path and Path(full_data_path).parent.exists():
