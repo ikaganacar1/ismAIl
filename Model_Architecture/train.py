@@ -302,8 +302,8 @@ def train_step(model, batch, device, config, scaler=None):
     input_ids = input_ids.to(device, non_blocking=True)
     target_ids = target_ids.to(device, non_blocking=True)
 
-    # Forward pass
-    with torch.cuda.amp.autocast(enabled=(config["training"]["dtype"] == "bf16")):
+    # Forward pass (using new torch.amp API)
+    with torch.amp.autocast(device_type='cuda', enabled=(config["training"]["dtype"] == "bf16")):
         output = model(input_ids, start_pos=0)
 
         # Handle model output (tuple in training mode with MoE, single tensor otherwise)
@@ -321,9 +321,16 @@ def train_step(model, batch, device, config, scaler=None):
         )
 
         # Total loss with load balancing
-        total_loss = lm_loss + config["training"].get("lb_loss_coef", 0.01) * lb_loss
+        # Ensure lb_loss is a tensor for proper gradient computation
+        if isinstance(lb_loss, float):
+            lb_loss_coef = 0.0  # If no MoE layer, no load balance loss
+            total_loss = lm_loss
+        else:
+            lb_loss_coef = config["training"].get("lb_loss_coef", 0.01)
+            total_loss = lm_loss + lb_loss_coef * lb_loss
 
-    return total_loss, lm_loss, lb_loss if isinstance(lb_loss, float) else lb_loss.item()
+    # Return scalar values for logging
+    return total_loss, lm_loss.item(), lb_loss if isinstance(lb_loss, float) else lb_loss.item()
 
 
 def main():
@@ -332,8 +339,11 @@ def main():
     
     # Device setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+
+    # Enable TF32 for better performance on Ampere+ GPUs (using new API)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.conv.fp32_precision = 'tf32'
+        torch.backends.cuda.matmul.fp32_precision = 'tf32'
     
     # Wandb setup
     if config["logging"]["use_wandb"] and HAS_WANDB:
@@ -365,8 +375,8 @@ def main():
         step = ckpt["step"]
         print(f"✅ Resumed from step {step}\n")
     
-    # Gradient scaler for mixed precision
-    scaler = torch.cuda.amp.GradScaler(enabled=(config["training"]["dtype"] == "bf16"))
+    # Gradient scaler for mixed precision (using new torch.amp API)
+    scaler = torch.amp.GradScaler(device='cuda', enabled=(config["training"]["dtype"] == "bf16"))
     
     # Expert rotation schedule
     current_expert = 0
@@ -412,19 +422,19 @@ def main():
             # Split batch for micro-batching (if needed)
             # For now, process full batch
             loss, lm_loss, lb_loss = train_step(model, batch, device, config, scaler)
-            
+
             # Normalize for accumulation
             loss = loss / accum_steps
-            
+
             # Backward pass
             if config["training"]["dtype"] == "bf16":
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
-            
+
             total_loss_accum += loss.item()
-            lm_loss_accum += lm_loss.item() / accum_steps
-            lb_loss_accum += lb_loss.item() / accum_steps
+            lm_loss_accum += lm_loss / accum_steps  # Already a float from train_step
+            lb_loss_accum += lb_loss / accum_steps  # Already a float from train_step
         
         # Gradient clipping
         if config["training"]["grad_clip"] > 0:
