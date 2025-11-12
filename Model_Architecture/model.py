@@ -251,8 +251,8 @@ class MultiHeadLatentAttention(nn.Module):
         wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size)
         wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
         q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
-        self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
-        self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
+        self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv).detach()
+        self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2).detach()
         scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
                 torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
 
@@ -485,9 +485,6 @@ class Block(nn.Module):
         x = x + ffn_out
         return x, lb_loss
     
-    def checkpoint_forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Wrapper for gradient checkpointing that captures other args"""
-        return self.forward(x, self.start_pos, self.freqs_cis, self.mask)
 
 
 #####################################

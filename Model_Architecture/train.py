@@ -294,11 +294,13 @@ def save_checkpoint(model, optimizer, step, config, expert_idx=None):
 def train_step(model, input_mb, target_mb, device, config, scaler=None):
     """Process a SINGLE micro-batch (already sliced)"""
     
-    # Move data to device
+    # Safety check for empty tensors
+    if input_mb.size(0) == 0:
+        return 0.0, 0.0
+    
     input_mb = input_mb.to(device, non_blocking=True)
     target_mb = target_mb.to(device, non_blocking=True)
 
-    # Forward pass
     with torch.amp.autocast(device_type='cuda', enabled=(config["training"]["dtype"] == "bf16")):
         output = model(input_mb, start_pos=0)
         
@@ -314,22 +316,21 @@ def train_step(model, input_mb, target_mb, device, config, scaler=None):
             ignore_index=-1,
         )
         
-        # Normalize for accumulation (divide by accum_steps)
+        # Normalize for accumulation
+        accum_steps = config["training"]["gradient_accumulation_steps"]
         if isinstance(lb_loss, float):
-            total_loss = lm_loss / config["training"]["gradient_accumulation_steps"]
+            total_loss = lm_loss / accum_steps
         else:
             lb_loss_coef = config["training"].get("lb_loss_coef", 0.01)
-            total_loss = (lm_loss + lb_loss_coef * lb_loss) / config["training"]["gradient_accumulation_steps"]
+            total_loss = (lm_loss + lb_loss_coef * lb_loss) / accum_steps
 
-    # Backward pass (automatically frees graph after backward)
+    # Backward
     if config["training"]["dtype"] == "bf16":
         scaler.scale(total_loss).backward()
     else:
         total_loss.backward()
     
-    # Return raw values for logging
     return lm_loss.item(), lb_loss if isinstance(lb_loss, float) else lb_loss.item()
-
 
 def main():
     args = parse_args()
