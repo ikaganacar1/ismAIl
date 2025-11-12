@@ -243,6 +243,7 @@ def load_data(config):
         shuffle=False,
         drop_last=True,
         use_memory_efficient=True,  # Use memory-efficient loading
+        is_val = True 
     )
 
     print(f"✅ Train batches: {len(train_loader)}")
@@ -256,25 +257,38 @@ def evaluate(model, val_loader, device, config):
     model.eval()
     total_loss = 0.0
     total_tokens = 0
-
+    max_batches = config["training"].get("max_val_batches", 50)  # Only 50 batches
+    
+    # Add progress bar
+    from tqdm import tqdm
+    pbar = tqdm(total=max_batches, desc="📊 Validating", ncols=80)
+    
+    val_dtype = config["training"]["dtype"]
     with torch.no_grad():
-        for input_ids, target_ids in val_loader:
-            input_ids = input_ids.to(device)
-            target_ids = target_ids.to(device)
-
-            # Model returns just logits in eval mode (no lb_loss)
-            output = model(input_ids, start_pos=0)
-            logits = output if not isinstance(output, tuple) else output[0]
-
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                target_ids.view(-1),
-                ignore_index=-1,
-            )
-
+        for i, (input_ids, target_ids) in enumerate(val_loader):
+            if i >= max_batches:
+                break
+                
+            input_ids = input_ids.to(device, non_blocking=True)
+            target_ids = target_ids.to(device, non_blocking=True)
+            
+            # Use autocast for speed
+            with torch.amp.autocast(device_type='cuda', enabled=(val_dtype == 'bf16')):
+                output = model(input_ids, start_pos=0)
+                logits = output[0] if isinstance(output, tuple) else output
+                
+                loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    target_ids.view(-1),
+                    ignore_index=-1,
+                )
+            
             total_loss += loss.item() * target_ids.numel()
             total_tokens += target_ids.numel()
-
+            pbar.update(1)
+            pbar.set_postfix({'loss': f'{loss.item():.3f}'})
+    
+    pbar.close()
     model.train()
     return total_loss / total_tokens
 
@@ -284,17 +298,16 @@ def save_checkpoint(model, optimizer, step, config, expert_idx=None):
     save_dir = Path(config["training"]["save_dir"])
     save_dir.mkdir(parents=True, exist_ok=True)
     
-    # Create checkpoint name
-    if expert_idx is not None:
-        ckpt_name = f"step_{step}_expert_{expert_idx}.pt"
-    else:
-        ckpt_name = f"step_{step}.pt"
-    
+    ckpt_name = f"step_{step}_expert_{expert_idx}.pt" if expert_idx is not None else f"step_{step}.pt"
     ckpt_path = save_dir / ckpt_name
+    
+    # 🔥 Exclude cache buffers - they should be reinitialized from config
+    state_dict = model.state_dict()
+    filtered_state_dict = {k: v for k, v in state_dict.items() if 'cache' not in k.lower()}
     
     checkpoint = {
         "step": step,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": filtered_state_dict,
         "optimizer_state_dict": optimizer.state_dict(),
         "config": config,
     }
@@ -406,11 +419,33 @@ def main():
     
     # Resume from checkpoint
     if args.resume:
+        print(f"📥 Loading checkpoint from {args.resume}...")
         ckpt = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"])
+        
+        # Create model with current config (ensures correct cache sizes)
+        model, model_args = setup_model(config, device)
+        
+        # Load state dict but skip/resize mismatched buffers
+        model_state_dict = model.state_dict()
+        loaded_state_dict = ckpt["model_state_dict"]
+        
+        skip_count = 0
+        for name, param in loaded_state_dict.items():
+            if name in model_state_dict:
+                if model_state_dict[name].shape != param.shape:
+                    if "cache" in name:  # Skip cache buffers
+                        skip_count += 1
+                        continue
+                    else:
+                        raise RuntimeError(f"Shape mismatch {name}: {param.shape} vs {model_state_dict[name].shape}")
+                model_state_dict[name].copy_(param)
+            else:
+                print(f"⚠️  Unexpected parameter: {name}")
+        
+        model.load_state_dict(model_state_dict, strict=False)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         step = ckpt["step"]
-        print(f"✅ Resumed from step {step}\n")
+        print(f"✅ Resumed from step {step} (skipped {skip_count} cache buffers)\n")
     
     # ✅ FIX: Only create scaler for FP16, not BF16 or FP32
     training_dtype = config["training"]["dtype"].lower()
@@ -571,3 +606,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
+    
+    
+    

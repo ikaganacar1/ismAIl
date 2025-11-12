@@ -1,1 +1,6 @@
 *.pyc
+Model_Architecture/wandb
+*.pt
+Model_Architecture/checkpoints/step_8000_expert_best.pt.old
+Model_Architecture/data/train.txt
+Model_Architecture/data/val.txt

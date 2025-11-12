@@ -1,0 +1,12 @@
+{
+  "dataset": "uonlp/CulturaX",
+  "subset": "tr",
+  "use_small": true,
+  "total_documents": 1471979,
+  "train_samples": 1398380,
+  "val_samples": 73599,
+  "train_ratio": 0.95,
+  "seed": 2357,
+  "train_file": "/mnt/2tb_ssd/ismAIl/Model_Architecture/data/train.txt",
+  "val_file": "/mnt/2tb_ssd/ismAIl/Model_Architecture/data/val.txt"
+}

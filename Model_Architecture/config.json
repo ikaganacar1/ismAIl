@@ -1,6 +1,6 @@
 {
     "model": {
-        "max_batch_size": 8,
+        "max_batch_size": 16,
         "max_seq_len": 512,
         "dtype": "fp32",
         "scale_fmt": null,
@@ -45,7 +45,9 @@
         "save_dir": "./checkpoints",
         "log_every": 100,
         "dtype": "fp32",
-        "compile": false
+        "compile": false,
+        "max_val_batches": 50,
+        "val_batch_size_multiplier": 4
     },
     "data": {
         "train_file": "./data/train.txt",

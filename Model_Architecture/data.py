@@ -7,6 +7,7 @@ from tqdm import tqdm
 import mmap
 import numpy as np
 import os
+import json
 
 from model import ModelArgs
 
@@ -257,6 +258,8 @@ def create_dataloader(
     max_samples: Optional[int] = None,
     use_turkish_tokenizer: bool = True,
     use_memory_efficient: bool = True,  # NEW: Use memory-efficient loading by default
+    is_val: bool = True 
+
 ) -> DataLoader:
 
     # Select tokenizer based on user preference
@@ -310,10 +313,21 @@ def create_dataloader(
     except Exception as e:
         raise RuntimeError(f"Failed to create dataset: {e}")
 
+    config_path = Path("config.json")
+    
+    with open(config_path,"r") as f:
+        config = json.load(f)
+        val_batch_size = config["model"]["max_batch_size"] #* config["training"].get("val_batch_size_multiplier", 4)
+
+    if is_val:
+        batch_size = val_batch_size
+    else:
+        batch_size = args.max_batch_size
+
     # Create DataLoader with optimized settings
     dataloader = DataLoader(
         dataset,
-        batch_size=args.max_batch_size,
+        batch_size=batch_size,
         shuffle=shuffle,
         drop_last=drop_last,
         num_workers=num_workers,
