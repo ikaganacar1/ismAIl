@@ -294,13 +294,20 @@ def save_checkpoint(model, optimizer, step, config, expert_idx=None):
 
 
 def train_step(model, batch, device, config, accum_step, accum_steps, scaler=None):
-    """Process a MICRO-batch for gradient accumulation"""
+    """Process a SINGLE micro-batch for gradient accumulation"""
     input_ids, target_ids = batch
     
-    # Split batch into micro-batches
-    micro_batch_size = input_ids.size(0) // accum_steps
+    batch_size = input_ids.size(0)
+    micro_batch_size = max(1, batch_size // accum_steps)
+    print(f"Batch size: {batch_size}, Micro-batch: {start_idx}:{end_idx}, Size: {input_mb.shape}")
+    
+    # Calculate slice indices
     start_idx = micro_batch_size * accum_step
-    end_idx = start_idx + micro_batch_size
+    end_idx = min(start_idx + micro_batch_size, batch_size)
+    
+    # 🚨 CRITICAL: Skip if this micro-batch is empty (last iteration)
+    if start_idx >= batch_size:
+        return 0.0, 0.0  # Return zero loss, will be divided later
     
     # Get micro-batch slices
     input_mb = input_ids[start_idx:end_idx].to(device, non_blocking=True)
@@ -425,8 +432,12 @@ def main():
         for accum_step in range(accum_steps):
             lm_loss, lb_loss = train_step(model, batch, device, config, 
                                         accum_step, accum_steps, scaler)
-            lm_loss_accum += lm_loss / accum_steps
-            lb_loss_accum += lb_loss / accum_steps
+            
+            # Only accumulate if not empty
+            if lm_loss > 0:
+                lm_loss_accum += lm_loss / accum_steps
+                lb_loss_accum += lb_loss / accum_steps
+                total_loss_accum += (lm_loss + lb_loss) / accum_steps
 
         
         # Gradient clipping
