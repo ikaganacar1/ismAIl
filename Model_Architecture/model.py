@@ -484,6 +484,10 @@ class Block(nn.Module):
 
         x = x + ffn_out
         return x, lb_loss
+    
+    def checkpoint_forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Wrapper for gradient checkpointing that captures other args"""
+        return self.forward(x, self.start_pos, self.freqs_cis, self.mask)
 
 
 #####################################
@@ -491,11 +495,12 @@ class Block(nn.Module):
 #####################################
 
 class ismail(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, use_checkpointing: bool = False):
         super().__init__()
         self.args = args
         self.vocab_size = args.vocab_size
         self.n_layers = args.n_layers
+        self.use_checkpointing = use_checkpointing
 
         self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
         self.layers = nn.ModuleList([Block(i, args) for i in range(args.n_layers)])
@@ -523,8 +528,18 @@ class ismail(nn.Module):
             mask = torch.hstack([torch.zeros((seqlen, start_pos), device=tokens.device), mask]).type_as(h)
 
         total_lb_loss = 0.0
+        
         for layer in self.layers:
-            h, lb_loss = layer(h, start_pos, freqs_cis, mask)
+            layer.start_pos = start_pos
+            layer.freqs_cis = freqs_cis
+            layer.mask = mask
+
+            if self.training and self.use_checkpointing:
+                from torch.utils.checkpoint import checkpoint
+                h, lb_loss = checkpoint(layer.checkpoint_forward, h)
+            else:
+                h, lb_loss = layer(h, start_pos, freqs_cis, mask)
+                
             if lb_loss is not None:
                 total_lb_loss += lb_loss
 
