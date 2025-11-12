@@ -1,0 +1,15 @@
+# Core dependencies
+torch
+tiktoken
+numpy
+
+# Triton for GPU kernels
+triton
+
+# Optional dependencies for training
+tqdm
+requests
+
+# Optional dependencies for experiment tracking and optimization
+wandb
+bitsandbytes
