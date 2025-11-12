@@ -129,7 +129,7 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
 
 
 class Linear(nn.Module):
-    dtype = torch.bfloat16
+    dtype = torch.float32
     scale_fmt: Optional[str] = None
 
     def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
@@ -187,7 +187,7 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.dim = dim
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.bfloat16)) 
+        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32)) 
 
     def forward(self, x: torch.Tensor):
         output = F.rms_norm(x, (self.dim,), self.weight, self.eps)
@@ -500,12 +500,17 @@ class ismail(nn.Module):
         self.n_layers = args.n_layers
 
         self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
+        nn.init.normal_(self.tok_embeddings.weight, mean=0.0, std=0.02)
+        
         self.layers = nn.ModuleList([Block(i, args) for i in range(args.n_layers)])
         self.norm = RMSNorm(args.dim)
         self.output = Linear(args.dim, args.vocab_size, bias=False)
         self.use_checkpointing = False
 
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
+        
+        if hasattr(self.output, 'weight'):
+            nn.init.normal_(self.output.weight, mean=0.0, std=0.02 / math.sqrt(args.n_layers))
 
     def set_active_expert(self, expert_idx: Optional[int]):
         """Set active expert for all MoE layers (for sequential training)"""

@@ -294,7 +294,19 @@ def save_checkpoint(model, optimizer, step, config, expert_idx=None):
 def train_step(model, input_mb, target_mb, device, config, scaler=None):
     """Process a SINGLE micro-batch (already sliced)"""
     
+    # 🚨 Validate data before processing
     if input_mb.size(0) == 0:
+        return 0.0, 0.0
+    
+    # Check for invalid token IDs (outside vocab range)
+    vocab_size = config["model"]["vocab_size"]
+    if input_mb.max() >= vocab_size or target_mb.max() >= vocab_size:
+        print(f"🚨 Invalid token detected! Max token: {input_mb.max().item()}, Vocab size: {vocab_size}")
+        return 0.0, 0.0
+    
+    # Check for NaN in data
+    if torch.isnan(input_mb).any() or torch.isnan(target_mb).any():
+        print("🚨 NaN detected in input data!")
         return 0.0, 0.0
     
     input_mb = input_mb.to(device, non_blocking=True)
@@ -309,9 +321,11 @@ def train_step(model, input_mb, target_mb, device, config, scaler=None):
             logits = output
             lb_loss = 0.0
         
-        # 🚨 DEBUG: Check for NaN in logits
+        # 🚨 Check for NaN in logits before computing loss
         if torch.isnan(logits).any():
-            print(f"🚨 NaN detected in logits! Scale: {logits.abs().max().item():.2f}")
+            print(f"🚨 NaN detected in logits! Scale: {logits.abs().max().item()}")
+            print(f"    Input range: [{input_mb.min().item()}, {input_mb.max().item()}]")
+            return 0.0, 0.0
         
         lm_loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
@@ -319,19 +333,22 @@ def train_step(model, input_mb, target_mb, device, config, scaler=None):
             ignore_index=-1,
         )
         
+        # 🚨 Check for NaN in loss components
+        if torch.isnan(lm_loss):
+            print(f"🚨 NaN in lm_loss!")
+            return 0.0, 0.0
+        
         accum_steps = config["training"]["gradient_accumulation_steps"]
         if isinstance(lb_loss, float):
             total_loss = lm_loss / accum_steps
         else:
+            if torch.isnan(lb_loss):
+                print(f"🚨 NaN in lb_loss! Setting to 0")
+                lb_loss = 0.0
             lb_loss_coef = config["training"].get("lb_loss_coef", 0.01)
             total_loss = (lm_loss + lb_loss_coef * lb_loss) / accum_steps
 
-    # 🚨 DEBUG: Check for NaN in total loss
-    if torch.isnan(total_loss):
-        print(f"🚨 NaN in total_loss! lm_loss: {lm_loss.item():.4f}, lb_loss: {lb_loss}")
-        return 0.0, 0.0 
-
-    # Backward
+    # Backward with NaN check
     if scaler is not None:
         scaler.scale(total_loss).backward()
     else:
