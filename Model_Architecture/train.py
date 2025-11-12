@@ -293,24 +293,12 @@ def save_checkpoint(model, optimizer, step, config, expert_idx=None):
     print(f"💾 Checkpoint saved: {ckpt_path}")
 
 
-def train_step(model, batch, device, config, accum_step, accum_steps, scaler=None):
-    """Process a SINGLE micro-batch for gradient accumulation"""
-    input_ids, target_ids = batch
+def train_step(model, input_mb, target_mb, device, config, scaler=None):
+    """Process a SINGLE micro-batch (already sliced)"""
     
-    batch_size = input_ids.size(0)
-    micro_batch_size = max(1, batch_size // accum_steps)
-    
-    # Calculate slice indices
-    start_idx = micro_batch_size * accum_step
-    end_idx = min(start_idx + micro_batch_size, batch_size)
-    
-    # 🚨 CRITICAL: Skip if this micro-batch is empty (last iteration)
-    if start_idx >= batch_size:
-        return 0.0, 0.0  # Return zero loss, will be divided later
-    
-    # Get micro-batch slices
-    input_mb = input_ids[start_idx:end_idx].to(device, non_blocking=True)
-    target_mb = target_ids[start_idx:end_idx].to(device, non_blocking=True)
+    # Move data to device
+    input_mb = input_mb.to(device, non_blocking=True)
+    target_mb = target_mb.to(device, non_blocking=True)
 
     # Forward pass
     with torch.amp.autocast(device_type='cuda', enabled=(config["training"]["dtype"] == "bf16")):
@@ -328,18 +316,20 @@ def train_step(model, batch, device, config, accum_step, accum_steps, scaler=Non
             ignore_index=-1,
         )
         
+        # Normalize for accumulation (divide by accum_steps)
         if isinstance(lb_loss, float):
-            total_loss = lm_loss / accum_steps
+            total_loss = lm_loss / config["training"]["gradient_accumulation_steps"]
         else:
             lb_loss_coef = config["training"].get("lb_loss_coef", 0.01)
-            total_loss = (lm_loss + lb_loss_coef * lb_loss) / accum_steps
+            total_loss = (lm_loss + lb_loss_coef * lb_loss) / config["training"]["gradient_accumulation_steps"]
 
-    # Backward
+    # Backward pass (automatically frees graph after backward)
     if config["training"]["dtype"] == "bf16":
         scaler.scale(total_loss).backward()
     else:
         total_loss.backward()
     
+    # Return raw values for logging
     return lm_loss.item(), lb_loss if isinstance(lb_loss, float) else lb_loss.item()
 
 
@@ -349,19 +339,13 @@ def main():
     
     # Device setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Enable TF32 for better performance on Ampere+ GPUs (using new API)
-    if torch.cuda.is_available():
-        torch.backends.cudnn.conv.fp32_precision = 'tf32'
-        torch.backends.cuda.matmul.fp32_precision = 'tf32'
+    torch.backends.cudnn.conv.fp32_precision = 'tf32'
+    torch.backends.cuda.matmul.fp32_precision = 'tf32'
     
     # Wandb setup
     if config["logging"]["use_wandb"] and HAS_WANDB:
-        wandb.init(
-            project=config["logging"]["project_name"],
-            name=config["logging"]["run_name"],
-            config=config,
-        )
+        wandb.init(project=config["logging"]["project_name"], 
+                  name=config["logging"]["run_name"], config=config)
     
     # Model setup
     model, model_args = setup_model(config, device)
@@ -385,25 +369,29 @@ def main():
         step = ckpt["step"]
         print(f"✅ Resumed from step {step}\n")
     
-    # Gradient scaler for mixed precision (using new torch.amp API)
+    # Gradient scaler
     scaler = torch.amp.GradScaler(device='cuda', enabled=(config["training"]["dtype"] == "bf16"))
     
-    # Expert rotation schedule
+    # Expert rotation
     current_expert = 0
     rotation_steps = config["training"]["expert_rotation_steps"]
-    
-    # Set initial expert
     model.set_active_expert(current_expert)
     print(f"🎯 Training expert {current_expert}/{model_args.n_routed_experts - 1}")
     
-    # Training loop
+    # ✅ DEFINE VARIABLES HERE - outside the loop
+    accum_steps = config["training"]["gradient_accumulation_steps"]
+    total_steps = config["training"]["total_steps"]
+    grad_clip = config["training"]["grad_clip"]
+    dtype_bf16 = config["training"]["dtype"] == "bf16"
+    
     print("\n" + "="*70)
     print("TRAINING STARTED")
     print("="*70 + "\n")
     
     model.train()
     
-    while step < config["training"]["total_steps"]:
+    # ✅ MAIN TRAINING LOOP
+    while step < total_steps:
         step_start = time.time()
         
         # Expert rotation
@@ -411,42 +399,56 @@ def main():
             current_expert = (current_expert + 1) % model_args.n_routed_experts
             model.set_active_expert(current_expert)
             print(f"\n🔄 Rotating to expert {current_expert}/{model_args.n_routed_experts - 1}")
-            
-            # Clear gradients after rotation
             optimizer.zero_grad(set_to_none=True)
         
-        # Get batch with cycle handling
+        # Get batch
         try:
             batch = next(train_iter)
         except StopIteration:
             train_iter = iter(train_loader)
             batch = next(train_iter)
         
-        # Training step with gradient accumulation
-        accum_steps = config["training"]["gradient_accumulation_steps"]
-        total_loss_accum = 0.0
+        # ✅ SPLIT BATCH OUTSIDE ACCUMULATION LOOP
+        input_ids, target_ids = batch
+        batch_size = input_ids.size(0)
+        micro_batch_size = batch_size // accum_steps
+        
+        # Initialize accumulators
         lm_loss_accum = 0.0
         lb_loss_accum = 0.0
-
+        
+        # ✅ GRADIENT ACCUMULATION LOOP
         for accum_step in range(accum_steps):
-            lm_loss, lb_loss = train_step(model, batch, device, config, 
-                                        accum_step, accum_steps, scaler)
+            # Calculate slice indices
+            start_idx = micro_batch_size * accum_step
             
-            # Only accumulate if not empty
-            if lm_loss > 0:
-                lm_loss_accum += lm_loss / accum_steps
-                lb_loss_accum += lb_loss / accum_steps
-                total_loss_accum += (lm_loss + lb_loss) / accum_steps
-
+            # Handle last micro-batch (includes remainder)
+            if accum_step == accum_steps - 1:
+                end_idx = batch_size
+            else:
+                end_idx = start_idx + micro_batch_size
+            
+            # Extract micro-batch
+            input_mb = input_ids[start_idx:end_idx]
+            target_mb = target_ids[start_idx:end_idx]
+            
+            # Process micro-batch
+            lm_loss, lb_loss = train_step(
+                model, input_mb, target_mb, device, config, scaler
+            )
+            
+            # Accumulate losses (normalized by accum_steps)
+            lm_loss_accum += lm_loss / accum_steps
+            lb_loss_accum += lb_loss / accum_steps
         
         # Gradient clipping
-        if config["training"]["grad_clip"] > 0:
-            if config["training"]["dtype"] == "bf16":
+        if grad_clip > 0:
+            if dtype_bf16:
                 scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config["training"]["grad_clip"])
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         
         # Optimizer step
-        if config["training"]["dtype"] == "bf16":
+        if dtype_bf16:
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -462,7 +464,7 @@ def main():
         # Logging
         if step % config["training"]["log_every"] == 0:
             step_time = time.time() - step_start
-            tokens_per_sec = (model_args.max_batch_size * model_args.max_seq_len) / step_time
+            tokens_per_sec = (batch_size * model_args.max_seq_len) / step_time
             
             print(f"Step {step:6d} | "
                   f"Loss: {lm_loss_accum:.4f} | "
@@ -476,7 +478,6 @@ def main():
                     "step": step,
                     "loss": lm_loss_accum,
                     "load_balance_loss": lb_loss_accum,
-                    "total_loss": total_loss_accum,
                     "learning_rate": lr,
                     "active_expert": current_expert,
                     "tokens_per_sec": tokens_per_sec,
@@ -492,7 +493,6 @@ def main():
             if config["logging"]["use_wandb"] and HAS_WANDB:
                 wandb.log({"val_loss": val_loss, "val_perplexity": math.exp(val_loss)})
             
-            # Save best model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 save_checkpoint(model, optimizer, step, config, expert_idx="best")
