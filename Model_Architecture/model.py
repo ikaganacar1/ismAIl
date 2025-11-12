@@ -505,6 +505,7 @@ class ismail(nn.Module):
         self.layers = nn.ModuleList([Block(i, args) for i in range(args.n_layers)])
         self.norm = RMSNorm(args.dim)
         self.output = Linear(args.dim, args.vocab_size, bias=False)
+        self.use_checkpointing = False
 
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
 
@@ -527,13 +528,13 @@ class ismail(nn.Module):
             mask = torch.hstack([torch.zeros((seqlen, start_pos), device=tokens.device), mask]).type_as(h)
 
         total_lb_loss = 0.0
-        
+
         for layer in self.layers:
             layer.start_pos = start_pos
             layer.freqs_cis = freqs_cis
             layer.mask = mask
 
-            if self.training and True:  # Enable gradient checkpointing during training
+            if self.training and self.use_checkpointing:
                 from torch.utils.checkpoint import checkpoint
                 h, lb_loss = checkpoint(layer.checkpoint_forward, h)
             else:

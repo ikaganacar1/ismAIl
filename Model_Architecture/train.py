@@ -136,28 +136,16 @@ def load_config(args):
 
 
 def setup_model(config, device):
-    """Initialize model and print size estimate"""
     args = ModelArgs(**config["model"])
-    
-    print("\n" + "="*70)
-    print("MODEL INITIALIZATION")
-    print("="*70 + "\n")
-    
-    # Estimate size
-    #size_info = estimate_model_size(args)
-
     model = ismail(args).to(device)
-
-    if config["training"].get("use_checkpointing", True):
-        for layer in model.layers:
-            layer.forward = lambda *args, layer=layer: checkpoint(layer._forward, *args)
-        print("✅ Gradient checkpointing enabled")
     
-    # Compile for speed (PyTorch 2.0+)
+    # Add this line to enable checkpointing
+    model.use_checkpointing = config["training"].get("use_checkpointing", True)
+    
     if config["training"]["compile"]:
         try:
             model = torch.compile(model)
-            print("✅ Model compiled with torch.compile()\n")
+            print("✅ Model compiled\n")
         except Exception as e:
             print(f"⚠️  Compilation failed: {e}\n")
     
