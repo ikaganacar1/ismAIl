@@ -69,7 +69,11 @@ def generate_text_with_sampling(model, idx, max_new_tokens, context_size, temper
             logits = model(idx_cond)
 
         # Focus only on the last time step
-        logits = logits[:, -1, :] / temperature
+        logits = logits[:, -1, :]
+
+        # Clamp temperature to avoid division by very small numbers
+        temperature = max(temperature, 1e-8)
+        logits = logits / temperature
 
         # Optional: apply top-k filtering
         if top_k is not None:
@@ -77,7 +81,15 @@ def generate_text_with_sampling(model, idx, max_new_tokens, context_size, temper
             logits[logits < v[:, [-1]]] = -float('Inf')
 
         # Apply softmax to get probabilities
-        probs = torch.softmax(logits, dim=-1)
+        probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
+
+        # Handle edge cases: check for invalid probabilities
+        if torch.isnan(probs).any() or torch.isinf(probs).any():
+            # Fallback to uniform distribution over valid tokens
+            probs = torch.ones_like(probs) / probs.size(-1)
+
+        # Ensure probabilities sum to 1
+        probs = probs / probs.sum(dim=-1, keepdim=True)
 
         # Sample from the distribution
         idx_next = torch.multinomial(probs, num_samples=1)
