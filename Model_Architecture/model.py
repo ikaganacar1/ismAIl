@@ -136,15 +136,27 @@ class Linear(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype or Linear.dtype))
+
+        # Set dtype
+        param_dtype = dtype or Linear.dtype
+
+        # Initialize weight with proper distribution
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=param_dtype))
+        # CRITICAL: Initialize weights!
+        nn.init.normal_(self.weight, mean=0.0, std=0.02 / math.sqrt(in_features))
+
         if self.weight.element_size() == 1:
             scale_out_features = (out_features + block_size - 1) // block_size
             scale_in_features = (in_features + block_size - 1) // block_size
             self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float32))
+            # Initialize scale to 1.0
+            nn.init.ones_(self.scale)
         else:
             self.register_parameter("scale", None)
+
         if bias:
-            self.bias = nn.Parameter(torch.empty(out_features))
+            self.bias = nn.Parameter(torch.empty(out_features, dtype=param_dtype))
+            nn.init.zeros_(self.bias)
         else:
             self.register_parameter("bias", None)
 
@@ -187,10 +199,12 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.dim = dim
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32)) 
+        # Keep weight in float32 for stability
+        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor):
-        output = F.rms_norm(x, (self.dim,), self.weight, self.eps)
+        # F.rms_norm handles dtype conversion internally
+        output = F.rms_norm(x.float(), (self.dim,), self.weight, self.eps)
         return output.to(x.dtype)
 
 
@@ -380,61 +394,67 @@ class MoE(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         original_shape = x.size()
         x = x.view(-1, self.dim)
-        
-        # Always compute routing (even in sequential mode to train the gate)
+
+        # Compute routing
         router_logits = F.linear(x, self.gate.weight)
         router_probs = router_logits.sigmoid()
-        
+
         if self.gate.bias is not None:
             router_logits = router_logits + self.gate.bias
-            
+
         # Select top-k experts
         weights, indices = torch.topk(router_probs, self.n_activated_experts, dim=-1)
 
-        # Normalize weights (sigmoid always needs normalization)
+        # Normalize weights
         weights = weights / weights.sum(dim=-1, keepdim=True)
         weights = weights * self.gate.route_scale
-        
-        # Sequential Training Mode - MEMORY EFFICIENT
-        # ONLY compute forward pass for the active expert to save GPU memory
+
+        # ✅ FIX: Sequential Training Mode - correct indexing logic
         if self.training and self.active_expert_idx is not None:
             y = torch.zeros_like(x)
-
-            # Run forward pass ONLY for the active expert
             i = self.active_expert_idx
-            idx, top = torch.where(indices == i)
+
+            # Find tokens where expert i is in the top-k
+            # indices shape: [num_tokens, top_k]
+            mask = (indices == i)  # shape: [num_tokens, top_k]
+            idx = torch.where(mask.any(dim=1))[0]  # token indices
 
             if idx.numel() > 0:
-                # Only this expert gets gradients and forward pass
+                # For each token, find which position in top-k contains expert i
+                top_positions = torch.argmax(mask[idx].int(), dim=1)  # shape: [num_selected_tokens]
+
+                # Get weights for expert i
+                expert_weights = weights[idx, top_positions].unsqueeze(-1)  # shape: [num_selected_tokens, 1]
+
+                # Forward pass ONLY for active expert
                 expert_out = self.experts[i](x[idx])
-                y[idx] = expert_out * weights[idx, top, None]
+                y[idx] = expert_out * expert_weights
 
-            # Inactive experts: Skip forward pass entirely (save memory!)
-            # Note: This means the model output will be degraded during training,
-            # but it's acceptable since we're training experts sequentially.
-            # The shared experts + active expert still provide reasonable outputs.
-
-            # Load balance loss (still needed for gate training)
+            # Load balance loss
             lb_loss = self.compute_load_balance_loss(router_probs, indices)
 
-            # Shared experts always train (provides baseline performance)
+            # Shared experts
             z = self.shared_experts(x)
 
             return (y + z).view(original_shape), lb_loss
-        
-        # Normal MoE Mode (inference or full training)
+
+        # Normal MoE Mode
         y = torch.zeros_like(x)
         for i in range(self.n_routed_experts):
-            idx, top = torch.where(indices == i)
+            mask = (indices == i)
+            idx = torch.where(mask.any(dim=1))[0]
+
             if idx.numel() == 0:
                 continue
-            
+
+            top_positions = torch.argmax(mask[idx].int(), dim=1)
+            expert_weights = weights[idx, top_positions].unsqueeze(-1)
             expert_out = self.experts[i](x[idx])
-            y[idx] += expert_out * weights[idx, top, None]
-        
+            y[idx] += expert_out * expert_weights
+
         z = self.shared_experts(x)
         output = (y + z).view(original_shape)
-        
+
         if self.training:
             lb_loss = self.compute_load_balance_loss(router_probs, indices)
             return output, lb_loss
@@ -499,18 +519,16 @@ class ismail(nn.Module):
         self.vocab_size = args.vocab_size
         self.n_layers = args.n_layers
 
-        self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
+        # Create embedding with correct dtype
+        self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim, dtype=Linear.dtype)
         nn.init.normal_(self.tok_embeddings.weight, mean=0.0, std=0.02)
-        
+
         self.layers = nn.ModuleList([Block(i, args) for i in range(args.n_layers)])
         self.norm = RMSNorm(args.dim)
-        self.output = Linear(args.dim, args.vocab_size, bias=False)
+        self.output = Linear(args.dim, args.vocab_size, bias=False, dtype=Linear.dtype)
         self.use_checkpointing = False
 
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
-        
-        if hasattr(self.output, 'weight'):
-            nn.init.normal_(self.output.weight, mean=0.0, std=0.02 / math.sqrt(args.n_layers))
 
     def set_active_expert(self, expert_idx: Optional[int]):
         """Set active expert for all MoE layers (for sequential training)"""

@@ -134,19 +134,31 @@ def load_config(args):
 
 
 def setup_model(config, device):
+    from model import Linear
+
     args = ModelArgs(**config["model"])
-    model = ismail(args).to(device)
-    
+
+    # ✅ CRITICAL: Set the global dtype for Linear layers
+    training_dtype = config["training"]["dtype"].lower()
+    if training_dtype == "bf16":
+        Linear.dtype = torch.bfloat16
+    elif training_dtype == "fp16":
+        Linear.dtype = torch.float16
+    else:
+        Linear.dtype = torch.float32
+
+    model = ismail(args).to(device=device, dtype=Linear.dtype)
+
     # Add this line to enable checkpointing
     model.use_checkpointing = config["training"].get("use_checkpointing", True)
-    
+
     if config["training"]["compile"]:
         try:
             model = torch.compile(model)
             print("✅ Model compiled\n")
         except Exception as e:
             print(f"⚠️  Compilation failed: {e}\n")
-    
+
     return model, args
 
 
@@ -293,22 +305,30 @@ def save_checkpoint(model, optimizer, step, config, expert_idx=None):
 
 def train_step(model, input_mb, target_mb, device, config, scaler=None):
     """Process a SINGLE micro-batch (already sliced)"""
-    
-    # 🚨 Validate data before processing
+
+    # 🚨 Validate data with more detail
     if input_mb.size(0) == 0:
+        print("🚨 Warning: Empty micro-batch received")
         return 0.0, 0.0
-    
-    # Check for invalid token IDs (outside vocab range)
+
     vocab_size = config["model"]["vocab_size"]
-    if input_mb.max() >= vocab_size or target_mb.max() >= vocab_size:
-        print(f"🚨 Invalid token detected! Max token: {input_mb.max().item()}, Vocab size: {vocab_size}")
-        return 0.0, 0.0
-    
+    input_max = input_mb.max().item()
+    target_max = target_mb.max().item()
+
+    if input_max >= vocab_size or target_max >= vocab_size:
+        print(f"🚨 Invalid token detected! "
+              f"Input max: {input_max}, Target max: {target_max}, "
+              f"Vocab size: {vocab_size}")
+        # Clamp tokens to valid range
+        input_mb = torch.clamp(input_mb, max=vocab_size-1)
+        target_mb = torch.clamp(target_mb, max=vocab_size-1)
+
     # Check for NaN in data
     if torch.isnan(input_mb).any() or torch.isnan(target_mb).any():
-        print("🚨 NaN detected in input data!")
-        return 0.0, 0.0
-    
+        print("🚨 NaN detected in input data! Replacing with zeros")
+        input_mb = torch.nan_to_num(input_mb, nan=0)
+        target_mb = torch.nan_to_num(target_mb, nan=0)
+
     input_mb = input_mb.to(device, non_blocking=True)
     target_mb = target_mb.to(device, non_blocking=True)
 
@@ -392,13 +412,20 @@ def main():
         step = ckpt["step"]
         print(f"✅ Resumed from step {step}\n")
     
-    # ✅ FIX: Only create scaler for FP16, not BF16
-    dtype_bf16 = config["training"]["dtype"] == "bf16"
-    if dtype_bf16:
+    # ✅ FIX: Only create scaler for FP16, not BF16 or FP32
+    training_dtype = config["training"]["dtype"].lower()
+    use_fp16 = training_dtype == "fp16"
+    use_bf16 = training_dtype == "bf16"
+
+    if use_fp16:
+        scaler = torch.amp.GradScaler(device='cuda', enabled=True)
+        print("✅ FP16 mode: Using GradScaler\n")
+    elif use_bf16:
         scaler = None
         print("⚠️  BF16 mode: Disabling GradScaler (not needed/supported)\n")
-    else:
-        scaler = torch.amp.GradScaler(device='cuda', enabled=True)
+    else:  # FP32
+        scaler = None
+        print("✅ FP32 mode: No scaler needed\n")
     
     # Expert rotation
     current_expert = 0
@@ -470,19 +497,17 @@ def main():
         
         # Gradient clipping (if enabled)
         if grad_clip > 0:
-            # Skip unscale for BF16
-            if not dtype_bf16:
+            # Only unscale if using FP16 scaler
+            if scaler is not None:
                 scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        
+
         # ✅ FIX: Conditional optimizer step
-        if dtype_bf16:
-            # BF16: Direct step
-            optimizer.step()
-        else:
-            # FP16: Scaled step
+        if scaler is not None:
             scaler.step(optimizer)
             scaler.update()
+        else:
+            optimizer.step()
         
         optimizer.zero_grad(set_to_none=True)
         
