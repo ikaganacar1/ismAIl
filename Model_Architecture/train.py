@@ -299,7 +299,6 @@ def train_step(model, batch, device, config, accum_step, accum_steps, scaler=Non
     
     batch_size = input_ids.size(0)
     micro_batch_size = max(1, batch_size // accum_steps)
-    print(f"Batch size: {batch_size}, Micro-batch: {start_idx}:{end_idx}, Size: {input_mb.shape}")
     
     # Calculate slice indices
     start_idx = micro_batch_size * accum_step
