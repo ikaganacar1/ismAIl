@@ -9,6 +9,67 @@ import numpy as np
 
 from model import ModelArgs
 
+# Turkish Tokenizer support
+try:
+    from turkish_tokenizer import TurkishTokenizer as TurkishTokenizerBase
+    TURKISH_TOKENIZER_AVAILABLE = True
+except ImportError:
+    TURKISH_TOKENIZER_AVAILABLE = False
+    TurkishTokenizerBase = None
+
+#####################################
+# TURKISH TOKENIZER WRAPPER
+#####################################
+class TurkishTokenizerWrapper:
+    """
+    Wrapper for Turkish Tokenizer to make it compatible with tiktoken interface.
+    This allows seamless integration with the existing TextDataset class.
+    """
+    def __init__(self):
+        if not TURKISH_TOKENIZER_AVAILABLE:
+            raise ImportError(
+                "turkish-tokenizer package is not installed. "
+                "Install it with: pip install turkish-tokenizer"
+            )
+        self.tokenizer = TurkishTokenizerBase()
+        self.name = "turkish-tokenizer"
+
+    def encode(self, text: str, allowed_special: Optional[set] = None) -> List[int]:
+        """
+        Encode text to token IDs (compatible with tiktoken interface).
+
+        Args:
+            text: Input text to tokenize
+            allowed_special: Not used for Turkish tokenizer, kept for compatibility
+
+        Returns:
+            List of token IDs
+        """
+        return self.tokenizer.encode(text)
+
+    def decode(self, tokens: List[int]) -> str:
+        """
+        Decode token IDs back to text.
+
+        Args:
+            tokens: List of token IDs
+
+        Returns:
+            Decoded text string
+        """
+        return self.tokenizer.decode(tokens)
+
+    @property
+    def n_vocab(self) -> int:
+        """Get vocabulary size"""
+        return self.tokenizer.vocab_size
+
+    @property
+    def max_token_value(self) -> int:
+        """Get maximum token value"""
+        return self.n_vocab - 1
+
+
 #####################################
 # DATA
 #####################################
@@ -28,9 +89,15 @@ class TextDataset(Dataset):
         self.stride = stride if stride is not None else self.max_seq_len // 2
         
         # Handle file paths efficiently with memory mapping
-        if Path(txt).exists():
-            text_content = self._read_file_mmap(txt)
-        else:
+        # Check if txt is a file path (avoid Path().exists() for long strings)
+        try:
+            path = Path(txt)
+            if len(txt) < 4096 and path.exists():  # Reasonable path length check
+                text_content = self._read_file_mmap(txt)
+            else:
+                text_content = txt
+        except (OSError, ValueError):
+            # If Path() fails or string is too long, treat as raw text
             text_content = txt
         
         # Validate input
@@ -126,11 +193,12 @@ def create_dataloader(
     num_workers: int = 0,
     pin_memory: bool = True,
     persistent_workers: bool = False,
-    max_samples: Optional[int] = None
+    max_samples: Optional[int] = None,
+    use_turkish_tokenizer: bool = False
 ) -> DataLoader:
     """
     Optimized DataLoader with proper memory pinning and worker settings.
-    
+
     Args:
         txt: Text content or file path
         args: ModelArgs configuration
@@ -141,12 +209,24 @@ def create_dataloader(
         pin_memory: Pin memory for faster GPU transfer (recommended)
         persistent_workers: Keep workers alive between epochs (if num_workers > 0)
         max_samples: Limit samples for testing
+        use_turkish_tokenizer: Use Turkish morphological tokenizer instead of tiktoken
     """
-    # Use the best default tokenizer for your setup
-    # tiktoken's gpt2 is fast, well-tested, and has reasonable vocab size (~50k)
-    # For multilingual or code, consider "cl100k_base" or "o200k_base"
-    tokenizer_name = getattr(args, "tokenizer_name", "gpt2")
-    tokenizer = tiktoken.get_encoding(tokenizer_name)
+    # Select tokenizer based on user preference
+    if use_turkish_tokenizer:
+        if not TURKISH_TOKENIZER_AVAILABLE:
+            raise ImportError(
+                "Turkish tokenizer requested but not available. "
+                "Install it with: pip install turkish-tokenizer"
+            )
+        tokenizer = TurkishTokenizerWrapper()
+        print(f"🇹🇷 Using Turkish Tokenizer (vocab size: {tokenizer.n_vocab:,})")
+    else:
+        # Use the best default tokenizer for your setup
+        # tiktoken's gpt2 is fast, well-tested, and has reasonable vocab size (~50k)
+        # For multilingual or code, consider "cl100k_base" or "o200k_base"
+        tokenizer_name = getattr(args, "tokenizer_name", "gpt2")
+        tokenizer = tiktoken.get_encoding(tokenizer_name)
+        print(f"📚 Using tiktoken tokenizer: {tokenizer_name} (vocab size: {tokenizer.n_vocab:,})")
     
     # Create dataset with size validation
     try:
@@ -186,3 +266,106 @@ def get_sample_data(url: str = "https://raw.githubusercontent.com/karpathy/char-
     except Exception as e:
         print(f"⚠️  Could not download sample data: {e}")
         return ""
+    
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("TOKENIZER TESTING")
+    print("=" * 60)
+
+    # Choose which tokenizer to test
+    USE_TURKISH = True  # Set to False to test tiktoken instead
+
+    if USE_TURKISH and TURKISH_TOKENIZER_AVAILABLE:
+        print("\n🇹🇷 Testing Turkish Tokenizer")
+        tokenizer = TurkishTokenizerWrapper()
+        print(f"📚 Tokenizer: {tokenizer.name}")
+        print(f"📊 Vocabulary Size: {tokenizer.n_vocab:,}")
+        print(f"📝 Max Token Value: {tokenizer.max_token_value:,}")
+    else:
+        # Test different tokenizers
+        tokenizer_name = "gpt2"  # Change to "cl100k_base" or "o200k_base" to test others
+        tokenizer = tiktoken.get_encoding(tokenizer_name)
+
+        print(f"\n📚 Tokenizer: {tokenizer_name}")
+        print(f"📊 Vocabulary Size: {tokenizer.n_vocab:,}")
+        print(f"📝 Max Token Value: {tokenizer.max_token_value:,}")
+        print(f"🔤 Name: {tokenizer.name}")
+
+    # Test encoding/decoding
+    if USE_TURKISH and TURKISH_TOKENIZER_AVAILABLE:
+        test_samples = [
+            "Merhaba Dünya!",
+            "İstanbul'da yaşıyorum ve Türkçe dilini öğreniyorum.",
+            "Kitap okumak çok güzeldir ve bilgi verir.",
+            "Türkiye Cumhuriyeti'nin başkenti Ankara'dır.",
+            "Yapay zeka ve makine öğrenmesi teknolojileri gelişiyor.",
+        ]
+    else:
+        test_samples = [
+            "Hello, world!",
+            "The quick brown fox jumps over the lazy dog.",
+            "Machine learning is fascinating.",
+            "print('Hello, World!')",  # Code sample
+            "日本語のテキスト",  # Non-English
+        ]
+
+    print("\n" + "=" * 60)
+    print("ENCODING EXAMPLES")
+    print("=" * 60)
+
+    for text in test_samples:
+        tokens = tokenizer.encode(text)
+        decoded = tokenizer.decode(tokens)
+        print(f"\nText: {text}")
+        print(f"Tokens ({len(tokens)}): {tokens}")
+        print(f"Token range: [{min(tokens)}, {max(tokens)}]")
+        print(f"Decoded: {decoded}")
+
+    # Test with actual data
+    print("\n" + "=" * 60)
+    print("DATALOADER TESTING")
+    print("=" * 60)
+
+    sample_text = get_sample_data()
+    if sample_text:
+        print(f"\n📄 Sample text length: {len(sample_text):,} characters")
+
+        # Tokenize sample
+        if USE_TURKISH and TURKISH_TOKENIZER_AVAILABLE:
+            full_tokens = tokenizer.encode(sample_text)
+        else:
+            full_tokens = tokenizer.encode(sample_text, allowed_special={"<|endoftext|>"})
+
+        print(f"🔢 Total tokens: {len(full_tokens):,}")
+        print(f"📈 Unique tokens used: {len(set(full_tokens)):,}")
+        print(f"📊 Vocabulary coverage: {len(set(full_tokens)) / tokenizer.n_vocab * 100:.2f}%")
+
+        # Create dataloader
+        args = ModelArgs(max_seq_len=128, max_batch_size=16)
+        dataloader = create_dataloader(
+            sample_text,
+            args,
+            num_workers=0,
+            max_samples=100,
+            use_turkish_tokenizer=USE_TURKISH and TURKISH_TOKENIZER_AVAILABLE
+        )
+
+        print(f"\n⚙️  DataLoader Config:")
+        print(f"   Sequence length: {args.max_seq_len}")
+        print(f"   Batch size: {args.max_batch_size}")
+        print(f"   Total batches: {len(dataloader)}")
+
+        # Test first batch
+        for batch_idx, (input_ids, target_ids) in enumerate(dataloader):
+            print(f"\n🎯 Batch {batch_idx}:")
+            print(f"   input_ids shape: {input_ids.shape}")
+            print(f"   target_ids shape: {target_ids.shape}")
+            print(f"   input_ids range: [{input_ids.min().item()}, {input_ids.max().item()}]")
+            print(f"   Sample input (first 10 tokens): {input_ids[0, :10].tolist()}")
+            print(f"   Decoded: {tokenizer.decode(input_ids[0, :10].tolist())}")
+            break
+
+    print("\n" + "=" * 60)
+    print("✅ Testing complete!")
+    print("=" * 60)
