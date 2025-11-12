@@ -187,7 +187,7 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.dim = dim
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.bfloat16)) 
 
     def forward(self, x: torch.Tensor):
         output = F.rms_norm(x, (self.dim,), self.weight, self.eps)
@@ -282,6 +282,7 @@ class Gate(nn.Module):
 
         # Gate weight
         self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim, dtype=Linear.dtype))
+        nn.init.normal_(self.weight, mean=0.0, std=0.02 / math.sqrt(args.dim)) 
 
         # Optional routing bias for fine-tuning expert selection
         if args.use_routing_bias:

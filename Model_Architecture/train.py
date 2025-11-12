@@ -294,7 +294,6 @@ def save_checkpoint(model, optimizer, step, config, expert_idx=None):
 def train_step(model, input_mb, target_mb, device, config, scaler=None):
     """Process a SINGLE micro-batch (already sliced)"""
     
-    # Safety check for empty tensors
     if input_mb.size(0) == 0:
         return 0.0, 0.0
     
@@ -310,13 +309,16 @@ def train_step(model, input_mb, target_mb, device, config, scaler=None):
             logits = output
             lb_loss = 0.0
         
+        # 🚨 DEBUG: Check for NaN in logits
+        if torch.isnan(logits).any():
+            print(f"🚨 NaN detected in logits! Scale: {logits.abs().max().item():.2f}")
+        
         lm_loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
             target_mb.view(-1),
             ignore_index=-1,
         )
         
-        # Normalize for accumulation
         accum_steps = config["training"]["gradient_accumulation_steps"]
         if isinstance(lb_loss, float):
             total_loss = lm_loss / accum_steps
@@ -324,7 +326,12 @@ def train_step(model, input_mb, target_mb, device, config, scaler=None):
             lb_loss_coef = config["training"].get("lb_loss_coef", 0.01)
             total_loss = (lm_loss + lb_loss_coef * lb_loss) / accum_steps
 
-    # ✅ FIXED: Check if scaler exists before using it
+    # 🚨 DEBUG: Check for NaN in total loss
+    if torch.isnan(total_loss):
+        print(f"🚨 NaN in total_loss! lm_loss: {lm_loss.item():.4f}, lb_loss: {lb_loss}")
+        return 0.0, 0.0 
+
+    # Backward
     if scaler is not None:
         scaler.scale(total_loss).backward()
     else:
