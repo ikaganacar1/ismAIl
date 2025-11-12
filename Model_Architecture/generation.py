@@ -1,6 +1,6 @@
 import torch
 import tiktoken
-from model import Transformer, ModelArgs
+from model import ismail, ModelArgs
 
 
 #####################################
@@ -151,7 +151,7 @@ if __name__ == "__main__":
     # Initialize model and tokenizer
     print("Initializing model...")
     torch.manual_seed(123)
-    model = Transformer(args)
+    model = ismail(args)
     model.eval()
 
     tokenizer = tiktoken.get_encoding("gpt2")

@@ -2,7 +2,7 @@ import tiktoken
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-
+from contextlib import nullcontext
 import math
 from dataclasses import dataclass
 from typing import Tuple, Optional, Literal
@@ -18,31 +18,32 @@ from kernel import act_quant, weight_dequant, fp8_gemm
 @dataclass
 class ModelArgs:
     max_batch_size: int = 8
-    max_seq_len: int = 4096 * 4
+    max_seq_len: int = 2048
     dtype: Literal["bf16", "fp8"] = "bf16"
     scale_fmt: Optional[str] = None
+
     vocab_size: int = 102400
-    dim: int = 2048
-    inter_dim: int = 10944
-    moe_inter_dim: int = 1408
-    n_layers: int = 27
-    n_dense_layers: int = 1
-    n_heads: int = 16
+    dim: int = 1024
+    inter_dim: int = 4096
+    moe_inter_dim: int = 1024
+    n_layers: int = 20
+    n_dense_layers: int = 3
+    n_heads: int = 12
+   
     # moe
-    n_routed_experts: int = 64
-    n_shared_experts: int = 2
-    n_activated_experts: int = 6
-    n_expert_groups: int = 1
-    n_limited_groups: int = 1
-    score_func: Literal["softmax", "sigmoid"] = "softmax"
+    n_routed_experts: int = 6
+    n_shared_experts: int = 1
+    n_activated_experts: int = 2
     route_scale: float = 1.
-    use_routing_bias: bool = False  # Enable routing bias for fine-tuning expert selection
+    use_routing_bias: bool = True  # Enable routing bias for fine-tuning expert selection
+    
     # mla
     q_lora_rank: int = 0
     kv_lora_rank: int = 512
     qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
+    
     # yarn
     original_seq_len: int = 4096
     rope_theta: float = 10000.0
@@ -58,54 +59,7 @@ block_size = 128
 gemm_impl: Literal["bf16", "fp8"] = "bf16"
 
 
-#####################################
-# DATA
-#####################################
-class TextDataset(Dataset):
-    def __init__(self, txt, tokenizer, args: ModelArgs, stride: Optional[int] = None):
-        self.input_ids = []
-        self.target_ids = []
 
-        # Use max_seq_len from ModelArgs
-        max_length = args.max_seq_len
-        if stride is None:
-            stride = max_length // 2  # Default stride is half the sequence length
-
-        # Tokenize the entire text
-        token_ids = tokenizer.encode(txt, allowed_special={"<|endoftext|>"})
-
-        # Use a sliding window to chunk the book into overlapping sequences of max_length
-        for i in range(0, len(token_ids) - max_length, stride):
-            input_chunk = token_ids[i:i + max_length]
-            target_chunk = token_ids[i + 1: i + max_length + 1]
-            self.input_ids.append(torch.tensor(input_chunk))
-            self.target_ids.append(torch.tensor(target_chunk))
-
-    def __len__(self):
-        return len(self.input_ids)
-
-    def __getitem__(self, idx):
-        return self.input_ids[idx], self.target_ids[idx]
-
-
-def create_dataloader(txt, args: ModelArgs, stride: Optional[int] = None,
-                         shuffle: bool = True, drop_last: bool = True, num_workers: int = 0):
-    # Initialize the tokenizer
-    tokenizer = tiktoken.get_encoding("gpt2")
-
-    # Create dataset with ModelArgs
-    dataset = TextDataset(txt, tokenizer, args, stride)
-
-    # Create dataloader using batch_size from ModelArgs
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.max_batch_size,
-        shuffle=shuffle,
-        drop_last=drop_last,
-        num_workers=num_workers
-    )
-
-    return dataloader
 
 #####################################
 # RoPE
@@ -321,9 +275,6 @@ class Gate(nn.Module):
         self.dim = args.dim
         self.n_routed_experts = args.n_routed_experts
         self.n_activated_experts = args.n_activated_experts
-        self.n_expert_groups = args.n_expert_groups
-        self.n_limited_groups = args.n_limited_groups
-        self.score_func = args.score_func
         self.route_scale = args.route_scale
 
         # Gate weight
@@ -341,27 +292,13 @@ class Gate(nn.Module):
         scores = linear(x, self.weight)
 
         # Apply scoring function
-        if self.score_func == "softmax":
-            scores = scores.softmax(dim=-1, dtype=torch.float32)
-        else:
-            scores = scores.sigmoid()
+        scores = scores.sigmoid()
 
         original_scores = scores
 
         # Apply routing bias if available
         if self.bias is not None:
             scores = scores + self.bias
-
-        # Expert grouping for load balancing
-        if self.n_expert_groups > 1:
-            scores = scores.view(x.size(0), self.n_expert_groups, -1)
-            if self.bias is None:
-                group_scores = scores.amax(dim=-1)
-            else:
-                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
-            indices = group_scores.topk(self.n_limited_groups, dim=-1)[1]
-            mask = scores.new_ones(x.size(0), self.n_expert_groups, dtype=bool).scatter_(1, indices, False)
-            scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
 
         # Select top-k experts
         indices = torch.topk(scores, self.n_activated_experts, dim=-1)[1]
@@ -391,56 +328,115 @@ class Expert(nn.Module):
 
 
 class MoE(nn.Module):
-    
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.dim = args.dim
         self.n_routed_experts = args.n_routed_experts
         self.n_activated_experts = args.n_activated_experts
-
-        # Gate for routing
+        self.active_expert_idx = None  # None = all active (inference mode)
+        
         self.gate = Gate(args)
-
-        # Routed experts
         self.experts = nn.ModuleList([
             Expert(args.dim, args.moe_inter_dim)
             for _ in range(args.n_routed_experts)
         ])
-
-        # Shared experts (always process all tokens)
         self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
+        self.ffn_norm = RMSNorm(args.dim)
+        
+        # Load balance loss coefficient
+        self.lb_loss_coef = 0.01
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def set_active_expert(self, expert_idx: Optional[int]):
+        """Freeze all but the active expert to save optimizer memory"""
+        self.active_expert_idx = expert_idx
+        
+        for i, expert in enumerate(self.experts):
+            requires_grad = (expert_idx is None) or (i == expert_idx)
+            for param in expert.parameters():
+                param.requires_grad = requires_grad
 
+    def compute_load_balance_loss(self, router_probs, expert_indices):
+        """Encourage uniform expert utilization"""
+        # router_probs: [num_tokens, n_experts]
+        # expert_indices: [num_tokens, top_k]
+        
+        # Token fraction per expert
+        tokens_per_expert = torch.zeros(self.n_routed_experts, device=router_probs.device)
+        indices_flat = expert_indices.view(-1)
+        ones = torch.ones_like(indices_flat, dtype=torch.float32)
+        tokens_per_expert.scatter_add_(0, indices_flat, ones)
+        tokens_per_expert = tokens_per_expert / (indices_flat.numel() + 1e-8)
+        
+        # Average routing probability per expert
+        router_prob_per_expert = router_probs.mean(dim=0)
+        
+        # Load balancing loss (minimize difference)
+        loss = torch.mean(tokens_per_expert * router_prob_per_expert) * self.n_routed_experts
+        return loss
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         original_shape = x.size()
         x = x.view(-1, self.dim)
-
-        # Route tokens to experts
-        weights, indices = self.gate(x)
-
-        # Initialize output for routed experts
+        
+        # Always compute routing (even in sequential mode to train the gate)
+        router_logits = F.linear(x, self.gate.weight)
+        router_probs = router_logits.sigmoid()
+        
+        if self.gate.bias is not None:
+            router_logits = router_logits + self.gate.bias
+            
+        # Select top-k experts
+        weights, indices = torch.topk(router_probs, self.n_activated_experts, dim=-1)
+        
+        # Normalize weights
+        if self.gate.score_func == "sigmoid":
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+        weights = weights * self.gate.route_scale
+        
+        # Sequential Training Mode
+        if self.training and self.active_expert_idx is not None:
+            y = torch.zeros_like(x)
+            
+            # Only compute gradients for active expert
+            for i in range(self.n_routed_experts):
+                idx, top = torch.where(indices == i)
+                if idx.numel() == 0:
+                    continue
+                
+                # Use gradient context manager
+                grad_context = nullcontext() if i == self.active_expert_idx else torch.no_grad()
+                
+                with grad_context:
+                    expert_out = self.experts[i](x[idx])
+                    y[idx] += expert_out * weights[idx, top, None]
+            
+            # Load balance loss (still needed for gate training)
+            lb_loss = self.compute_load_balance_loss(router_probs, indices)
+            
+            # Shared experts always train
+            z = self.shared_experts(x)
+            
+            return (y + z).view(original_shape), lb_loss
+        
+        # Normal MoE Mode (inference or full training)
         y = torch.zeros_like(x)
-
-        # Process each routed expert
         for i in range(self.n_routed_experts):
-            # Find tokens routed to this expert
             idx, top = torch.where(indices == i)
             if idx.numel() == 0:
                 continue
-
-            # Process tokens with this expert
-            expert_output = self.experts[i](x[idx])
-
-            # Weight and accumulate expert outputs
-            y[idx] += expert_output * weights[idx, top, None]
-
-        # Process all tokens with shared experts
+            
+            expert_out = self.experts[i](x[idx])
+            y[idx] += expert_out * weights[idx, top, None]
+        
         z = self.shared_experts(x)
-
-        # Combine routed and shared expert outputs
         output = (y + z).view(original_shape)
+        
+        if self.training:
+            lb_loss = self.compute_load_balance_loss(router_probs, indices)
+            return output, lb_loss
+        else:
+            return output, None
 
-        return output
 
 
 #####################################
@@ -482,7 +478,7 @@ class Block(nn.Module):
 # TRANSFORMER MODEL
 #####################################
 
-class Transformer(nn.Module):
+class ismail(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
