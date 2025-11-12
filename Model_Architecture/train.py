@@ -1,16 +1,20 @@
-#!/usr/bin/env python3
-"""
-Sequential Expert Training Script for MoE on Single GPU
-Memory Usage: ~7.2GB (vs 10.9GB for full MoE)
-"""
 
 import argparse
 import torch
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+
+torch.cuda.empty_cache()
+
 import torch.nn.functional as F
 from pathlib import Path
 import json
 import time
 import math
+from torch.utils.checkpoint import checkpoint
+
 
 # Import your model
 from model import ismail, ModelArgs
@@ -143,6 +147,11 @@ def setup_model(config, device):
     #size_info = estimate_model_size(args)
     
     model = ismail(args).to(device)
+
+    if config["training"].get("use_checkpointing", True):
+        for layer in model.layers:
+            layer.forward = lambda *args, layer=layer: checkpoint(layer._forward, *args)
+        print("✅ Gradient checkpointing enabled")
     
     # Compile for speed (PyTorch 2.0+)
     if config["training"]["compile"]:
@@ -296,41 +305,48 @@ def save_checkpoint(model, optimizer, step, config, expert_idx=None):
     print(f"💾 Checkpoint saved: {ckpt_path}")
 
 
-def train_step(model, batch, device, config, scaler=None):
-    """Single training step"""
+def train_step(model, batch, device, config, accum_step, accum_steps, scaler=None):
+    """Process a MICRO-batch for gradient accumulation"""
     input_ids, target_ids = batch
-    input_ids = input_ids.to(device, non_blocking=True)
-    target_ids = target_ids.to(device, non_blocking=True)
+    
+    # Split batch into micro-batches
+    micro_batch_size = input_ids.size(0) // accum_steps
+    start_idx = micro_batch_size * accum_step
+    end_idx = start_idx + micro_batch_size
+    
+    # Get micro-batch slices
+    input_mb = input_ids[start_idx:end_idx].to(device, non_blocking=True)
+    target_mb = target_ids[start_idx:end_idx].to(device, non_blocking=True)
 
-    # Forward pass (using new torch.amp API)
+    # Forward pass
     with torch.amp.autocast(device_type='cuda', enabled=(config["training"]["dtype"] == "bf16")):
-        output = model(input_ids, start_pos=0)
-
-        # Handle model output (tuple in training mode with MoE, single tensor otherwise)
+        output = model(input_mb, start_pos=0)
+        
         if isinstance(output, tuple):
             logits, lb_loss = output
         else:
             logits = output
             lb_loss = 0.0
-
-        # Main language modeling loss
+        
         lm_loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
-            target_ids.view(-1),
+            target_mb.view(-1),
             ignore_index=-1,
         )
-
-        # Total loss with load balancing
-        # Ensure lb_loss is a tensor for proper gradient computation
+        
         if isinstance(lb_loss, float):
-            lb_loss_coef = 0.0  # If no MoE layer, no load balance loss
-            total_loss = lm_loss
+            total_loss = lm_loss / accum_steps
         else:
             lb_loss_coef = config["training"].get("lb_loss_coef", 0.01)
-            total_loss = lm_loss + lb_loss_coef * lb_loss
+            total_loss = (lm_loss + lb_loss_coef * lb_loss) / accum_steps
 
-    # Return scalar values for logging
-    return total_loss, lm_loss.item(), lb_loss if isinstance(lb_loss, float) else lb_loss.item()
+    # Backward
+    if config["training"]["dtype"] == "bf16":
+        scaler.scale(total_loss).backward()
+    else:
+        total_loss.backward()
+    
+    return lm_loss.item(), lb_loss if isinstance(lb_loss, float) else lb_loss.item()
 
 
 def main():
@@ -417,24 +433,13 @@ def main():
         total_loss_accum = 0.0
         lm_loss_accum = 0.0
         lb_loss_accum = 0.0
-        
+
         for accum_step in range(accum_steps):
-            # Split batch for micro-batching (if needed)
-            # For now, process full batch
-            loss, lm_loss, lb_loss = train_step(model, batch, device, config, scaler)
+            lm_loss, lb_loss = train_step(model, batch, device, config, 
+                                        accum_step, accum_steps, scaler)
+            lm_loss_accum += lm_loss / accum_steps
+            lb_loss_accum += lb_loss / accum_steps
 
-            # Normalize for accumulation
-            loss = loss / accum_steps
-
-            # Backward pass
-            if config["training"]["dtype"] == "bf16":
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-
-            total_loss_accum += loss.item()
-            lm_loss_accum += lm_loss / accum_steps  # Already a float from train_step
-            lb_loss_accum += lb_loss / accum_steps  # Already a float from train_step
         
         # Gradient clipping
         if config["training"]["grad_clip"] > 0:
