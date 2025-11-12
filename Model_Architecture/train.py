@@ -13,12 +13,10 @@ from pathlib import Path
 import json
 import time
 import math
-from torch.utils.checkpoint import checkpoint
 
 
 # Import your model
 from model import ismail, ModelArgs
-from model_size import estimate_model_size
 
 # Try to import optional dependencies
 try:

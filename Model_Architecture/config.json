@@ -1,6 +1,6 @@
 {
     "model": {
-        "max_batch_size": 2,
+        "max_batch_size": 8,
         "max_seq_len": 512,
         "dtype": "bf16",
         "scale_fmt": null,
@@ -37,7 +37,7 @@
         "grad_clip": 1.0,
         "warmup_steps": 1000,
         "total_steps": 100000,
-        "use_checkpointing": true,
+        "use_checkpointing": false,
         "expert_rotation_steps": 5000,
         "gradient_accumulation_steps": 8,
         "eval_every": 1000,
@@ -45,7 +45,7 @@
         "save_dir": "./checkpoints",
         "log_every": 100,
         "dtype": "bf16",
-        "compile": true
+        "compile": false
     },
     "data": {
         "train_file": "./data/train.txt",

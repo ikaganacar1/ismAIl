@@ -520,7 +520,6 @@ class ismail(nn.Module):
         h = self.tok_embeddings(tokens).to(Linear.dtype)
         freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
 
-        # Create causal mask
         mask = None
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
@@ -528,25 +527,16 @@ class ismail(nn.Module):
             mask = torch.hstack([torch.zeros((seqlen, start_pos), device=tokens.device), mask]).type_as(h)
 
         total_lb_loss = 0.0
-
+        
+        # ✅ SIMPLE forward pass - no checkpointing
         for layer in self.layers:
-            layer.start_pos = start_pos
-            layer.freqs_cis = freqs_cis
-            layer.mask = mask
-
-            if self.training and self.use_checkpointing:
-                from torch.utils.checkpoint import checkpoint
-                h, lb_loss = checkpoint(layer.checkpoint_forward, h, use_reentrant=False )
-            else:
-                h, lb_loss = layer(h, start_pos, freqs_cis, mask)
-                
+            h, lb_loss = layer(h, start_pos, freqs_cis, mask)
             if lb_loss is not None:
                 total_lb_loss += lb_loss
 
         h = self.norm(h)
         output = self.output(h)
 
-        # Return output and total load balancing loss if training
         if self.training and total_lb_loss > 0:
             return output, total_lb_loss
         return output
