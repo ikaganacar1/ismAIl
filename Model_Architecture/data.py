@@ -21,10 +21,6 @@ except ImportError:
 # TURKISH TOKENIZER WRAPPER
 #####################################
 class TurkishTokenizerWrapper:
-    """
-    Wrapper for Turkish Tokenizer to make it compatible with tiktoken interface.
-    This allows seamless integration with the existing TextDataset class.
-    """
     def __init__(self):
         if not TURKISH_TOKENIZER_AVAILABLE:
             raise ImportError(
@@ -35,28 +31,9 @@ class TurkishTokenizerWrapper:
         self.name = "turkish-tokenizer"
 
     def encode(self, text: str, allowed_special: Optional[set] = None) -> List[int]:
-        """
-        Encode text to token IDs (compatible with tiktoken interface).
-
-        Args:
-            text: Input text to tokenize
-            allowed_special: Not used for Turkish tokenizer, kept for compatibility
-
-        Returns:
-            List of token IDs
-        """
         return self.tokenizer.encode(text)
 
     def decode(self, tokens: List[int]) -> str:
-        """
-        Decode token IDs back to text.
-
-        Args:
-            tokens: List of token IDs
-
-        Returns:
-            Decoded text string
-        """
         return self.tokenizer.decode(tokens)
 
     @property
@@ -75,16 +52,6 @@ class TurkishTokenizerWrapper:
 #####################################
 class TextDataset(Dataset):
     def __init__(self, txt: str, tokenizer, args: ModelArgs, stride: Optional[int] = None, max_samples: Optional[int] = None):
-        """
-        Optimized text dataset with memory-mapped reading and batched tokenization.
-        
-        Args:
-            txt: Text content or path to file
-            tokenizer: Pretrained tokenizer with .encode() method
-            args: ModelArgs containing max_seq_len, max_batch_size
-            stride: Sliding window stride. Defaults to max_seq_len // 2
-            max_samples: Limit number of samples for quick testing
-        """
         self.max_seq_len = args.max_seq_len
         self.stride = stride if stride is not None else self.max_seq_len // 2
         
@@ -115,7 +82,6 @@ class TextDataset(Dataset):
         print(f"✅ Created {len(self.samples)} training samples")
 
     def _read_file_mmap(self, file_path: str) -> str:
-        """Memory-efficient file reading for large files"""
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
@@ -124,7 +90,6 @@ class TextDataset(Dataset):
             raise RuntimeError(f"Failed to read file {file_path}: {e}")
 
     def _tokenize_with_progress(self, tokenizer, text: str) -> List[int]:
-        """Tokenize with progress bar for large texts"""
         # Process in chunks for memory efficiency
         chunk_size = 10_000_000  # 10MB chunks
         tokens = []
@@ -148,7 +113,6 @@ class TextDataset(Dataset):
         return tokens
 
     def _create_sliding_windows(self, token_ids: List[int], max_samples: Optional[int]) -> torch.Tensor:
-        """Create overlapping sequences using vectorized operations"""
         if len(token_ids) < self.max_seq_len + 1:
             raise ValueError(f"Not enough tokens. Need {self.max_seq_len + 1}, got {len(token_ids)}")
         
@@ -194,23 +158,9 @@ def create_dataloader(
     pin_memory: bool = True,
     persistent_workers: bool = False,
     max_samples: Optional[int] = None,
-    use_turkish_tokenizer: bool = False
+    use_turkish_tokenizer: bool = True
 ) -> DataLoader:
-    """
-    Optimized DataLoader with proper memory pinning and worker settings.
 
-    Args:
-        txt: Text content or file path
-        args: ModelArgs configuration
-        stride: Sliding window stride
-        shuffle: Whether to shuffle samples
-        drop_last: Drop incomplete batches
-        num_workers: Number of data loading workers (0 = main process)
-        pin_memory: Pin memory for faster GPU transfer (recommended)
-        persistent_workers: Keep workers alive between epochs (if num_workers > 0)
-        max_samples: Limit samples for testing
-        use_turkish_tokenizer: Use Turkish morphological tokenizer instead of tiktoken
-    """
     # Select tokenizer based on user preference
     if use_turkish_tokenizer:
         if not TURKISH_TOKENIZER_AVAILABLE:

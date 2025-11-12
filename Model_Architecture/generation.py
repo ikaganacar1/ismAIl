@@ -1,6 +1,7 @@
 import torch
 import tiktoken
 from model import ismail, ModelArgs
+from data import TurkishTokenizerWrapper, TURKISH_TOKENIZER_AVAILABLE
 
 
 #####################################
@@ -93,12 +94,17 @@ def text_to_token_ids(text, tokenizer):
 
     Args:
         text: Input text string
-        tokenizer: Tokenizer instance
+        tokenizer: Tokenizer instance (tiktoken or TurkishTokenizerWrapper)
 
     Returns:
         Tensor of token IDs with shape (1, seq_len)
     """
-    encoded = tokenizer.encode(text, allowed_special={"<|endoftext|>"})
+    # Turkish tokenizer doesn't support allowed_special parameter
+    if isinstance(tokenizer, TurkishTokenizerWrapper):
+        encoded = tokenizer.encode(text)
+    else:
+        encoded = tokenizer.encode(text, allowed_special={"<|endoftext|>"})
+
     encoded_tensor = torch.tensor(encoded).unsqueeze(0)
     return encoded_tensor
 
@@ -109,7 +115,7 @@ def token_ids_to_text(token_ids, tokenizer):
 
     Args:
         token_ids: Tensor of token IDs, can be 1D or 2D
-        tokenizer: Tokenizer instance
+        tokenizer: Tokenizer instance (tiktoken or TurkishTokenizerWrapper)
 
     Returns:
         Decoded text string
@@ -123,6 +129,32 @@ def token_ids_to_text(token_ids, tokenizer):
     return tokenizer.decode(flat)
 
 
+def get_tokenizer(use_turkish=False, tokenizer_name="gpt2"):
+    """
+    Get the appropriate tokenizer based on user preference.
+
+    Args:
+        use_turkish: Whether to use Turkish tokenizer
+        tokenizer_name: Name of tiktoken tokenizer to use if not using Turkish
+
+    Returns:
+        Tokenizer instance (TurkishTokenizerWrapper or tiktoken tokenizer)
+    """
+    if use_turkish:
+        if not TURKISH_TOKENIZER_AVAILABLE:
+            raise ImportError(
+                "Turkish tokenizer requested but not available. "
+                "Install it with: pip install turkish-tokenizer"
+            )
+        tokenizer = TurkishTokenizerWrapper()
+        print(f"🇹🇷 Using Turkish Tokenizer (vocab size: {tokenizer.n_vocab:,})")
+        return tokenizer
+    else:
+        tokenizer = tiktoken.get_encoding(tokenizer_name)
+        print(f"📚 Using tiktoken tokenizer: {tokenizer_name} (vocab size: {tokenizer.n_vocab:,})")
+        return tokenizer
+
+
 #####################################
 # EXAMPLE USAGE
 #####################################
@@ -130,6 +162,9 @@ def token_ids_to_text(token_ids, tokenizer):
 if __name__ == "__main__":
     import json
     from pathlib import Path
+
+    # Configuration: Set to True to use Turkish tokenizer, False for tiktoken
+    USE_TURKISH_TOKENIZER = False  # Change this to True for Turkish text generation
 
     # Example configuration - smaller model for testing
     config_path = Path("config.json")
@@ -142,22 +177,34 @@ if __name__ == "__main__":
         print("⚠️ config.json not found, using default ModelArgs")
         args = ModelArgs()
 
+    # Initialize tokenizer
+    tokenizer_name = getattr(args, "tokenizer_name", "gpt2")
+    tokenizer = get_tokenizer(
+        use_turkish=USE_TURKISH_TOKENIZER,
+        tokenizer_name=tokenizer_name
+    )
 
-    # Initialize model and tokenizer
+    # Update vocab size if using Turkish tokenizer
+    if USE_TURKISH_TOKENIZER and isinstance(tokenizer, TurkishTokenizerWrapper):
+        args.vocab_size = tokenizer.n_vocab
+        print(f"📊 Updated vocab_size to {args.vocab_size:,} for Turkish tokenizer")
+
+    # Initialize model
     print("Initializing model...")
     torch.manual_seed(123)
     model = ismail(args)
     model.eval()
-
-    tokenizer_name = getattr(args, "tokenizer_name", "gpt2")
-    tokenizer = tiktoken.get_encoding(tokenizer_name)
 
     # Example 1: Greedy generation (argmax)
     print(f"\n{'='*60}")
     print("EXAMPLE 1: GREEDY GENERATION (ARGMAX)")
     print(f"{'='*60}")
 
-    start_context = "Hello, I am"
+    # Use Turkish or English prompts based on tokenizer
+    if USE_TURKISH_TOKENIZER:
+        start_context = "Merhaba, ben"
+    else:
+        start_context = "Hello, I am"
     print(f"\nInput: '{start_context}'")
 
     token_ids = text_to_token_ids(start_context, tokenizer)
@@ -179,7 +226,10 @@ if __name__ == "__main__":
     print("EXAMPLE 2: SAMPLING WITH TEMPERATURE")
     print(f"{'='*60}")
 
-    start_context = "Once upon a time"
+    if USE_TURKISH_TOKENIZER:
+        start_context = "Bir varmış bir yokmuş"
+    else:
+        start_context = "Once upon a time"
     print(f"\nInput: '{start_context}'")
 
     token_ids = text_to_token_ids(start_context, tokenizer)
@@ -202,7 +252,10 @@ if __name__ == "__main__":
     print("EXAMPLE 3: TOP-K SAMPLING")
     print(f"{'='*60}")
 
-    start_context = "The future of AI is"
+    if USE_TURKISH_TOKENIZER:
+        start_context = "Yapay zekanın geleceği"
+    else:
+        start_context = "The future of AI is"
     print(f"\nInput: '{start_context}'")
 
     token_ids = text_to_token_ids(start_context, tokenizer)
