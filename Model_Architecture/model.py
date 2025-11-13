@@ -395,33 +395,27 @@ class MoE(nn.Module):
         original_shape = x.size()
         x = x.view(-1, self.dim)
 
-        router_logits = F.linear(x, self.gate.weight, self.gate.bias)  # Use bias directly
+        router_logits = linear(x, self.gate.weight, self.gate.bias)
         router_probs = router_logits.sigmoid()
         weights, indices = torch.topk(router_probs, self.n_activated_experts, dim=-1)
         
-
         # Normalize weights
-        weights = weights / weights.sum(dim=-1, keepdim=True)
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)  # Add epsilon for stability
         weights = weights * self.gate.route_scale
 
-        # ✅ FIX: Sequential Training Mode - correct indexing logic
+        # CRITICAL FIX: Check training mode AND active expert
         if self.training and self.active_expert_idx is not None:
+            # Sequential training mode - only train one expert
             y = torch.zeros_like(x)
             i = self.active_expert_idx
 
             # Find tokens where expert i is in the top-k
-            # indices shape: [num_tokens, top_k]
-            mask = (indices == i)  # shape: [num_tokens, top_k]
-            idx = torch.where(mask.any(dim=1))[0]  # token indices
+            mask = (indices == i)
+            idx = torch.where(mask.any(dim=1))[0]
 
             if idx.numel() > 0:
-                # For each token, find which position in top-k contains expert i
-                top_positions = torch.argmax(mask[idx].int(), dim=1)  # shape: [num_selected_tokens]
-
-                # Get weights for expert i
-                expert_weights = weights[idx, top_positions].unsqueeze(-1)  # shape: [num_selected_tokens, 1]
-
-                # Forward pass ONLY for active expert
+                top_positions = torch.argmax(mask[idx].int(), dim=1)
+                expert_weights = weights[idx, top_positions].unsqueeze(-1)
                 expert_out = self.experts[i](x[idx])
                 y[idx] = expert_out * expert_weights
 
@@ -430,31 +424,32 @@ class MoE(nn.Module):
 
             # Shared experts
             z = self.shared_experts(x)
-
             return (y + z).view(original_shape), lb_loss
-
-        # Normal MoE Mode
-        y = torch.zeros_like(x)
-        for i in range(self.n_routed_experts):
-            mask = (indices == i)
-            idx = torch.where(mask.any(dim=1))[0]
-
-            if idx.numel() == 0:
-                continue
-
-            top_positions = torch.argmax(mask[idx].int(), dim=1)
-            expert_weights = weights[idx, top_positions].unsqueeze(-1)
-            expert_out = self.experts[i](x[idx])
-            y[idx] += expert_out * expert_weights
-
-        z = self.shared_experts(x)
-        output = (y + z).view(original_shape)
-
-        if self.training:
-            lb_loss = self.compute_load_balance_loss(router_probs, indices)
-            return output, lb_loss
+        
         else:
-            return output, None
+            # Inference mode or all-experts training mode
+            y = torch.zeros_like(x)
+            for i in range(self.n_routed_experts):
+                mask = (indices == i)
+                idx = torch.where(mask.any(dim=1))[0]
+
+                if idx.numel() == 0:
+                    continue
+
+                top_positions = torch.argmax(mask[idx].int(), dim=1)
+                expert_weights = weights[idx, top_positions].unsqueeze(-1)
+                expert_out = self.experts[i](x[idx])
+                y[idx] += expert_out * expert_weights
+
+            z = self.shared_experts(x)
+            output = (y + z).view(original_shape)
+
+            # Only compute load balance loss during training
+            if self.training:
+                lb_loss = self.compute_load_balance_loss(router_probs, indices)
+                return output, lb_loss
+            else:
+                return output, None
 
 
 
@@ -536,6 +531,7 @@ class ismail(nn.Module):
         h = self.tok_embeddings(tokens).to(Linear.dtype)
         freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
 
+        # CRITICAL: Always clear caches at start_pos=0, regardless of training mode
         if start_pos == 0:
             for layer in self.layers:
                 if hasattr(layer.attn, 'kv_cache'):
@@ -545,9 +541,9 @@ class ismail(nn.Module):
 
         mask = None
         if seqlen > 1:
-            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device, dtype=h.dtype)
             mask = torch.triu(mask, diagonal=1)
-            mask = torch.hstack([torch.zeros((seqlen, start_pos), device=tokens.device), mask]).type_as(h)
+            mask = torch.hstack([torch.zeros((seqlen, start_pos), device=tokens.device, dtype=h.dtype), mask])
 
         total_lb_loss = 0.0
         
@@ -559,7 +555,8 @@ class ismail(nn.Module):
         h = self.norm(h)
         output = self.output(h)
 
+        # FIX: Only return load balance loss during training
         if self.training and total_lb_loss > 0:
             return output, total_lb_loss
-        return output
-
+        else:
+            return output

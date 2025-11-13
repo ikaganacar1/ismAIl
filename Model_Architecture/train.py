@@ -264,6 +264,17 @@ def evaluate(model, val_loader, device, config, tokenizer, active_expert=None):
     """
     model.eval()
     
+    # CRITICAL FIX: Store original gradient requirements for experts
+    original_expert_grads = {}
+    for name, param in model.named_parameters():
+        if "experts" in name:
+            original_expert_grads[name] = param.requires_grad
+    
+    # Enable gradients for all experts during evaluation
+    for name, param in model.named_parameters():
+        if "experts" in name:
+            param.requires_grad = True
+    
     # Clear caches...
     for layer in model.layers:
         if hasattr(layer.attn, 'kv_cache'):
@@ -273,11 +284,18 @@ def evaluate(model, val_loader, device, config, tokenizer, active_expert=None):
     
     # Set expert mode for validation
     if hasattr(model, 'set_active_expert'):
-        model.set_active_expert(active_expert)
+        # CRITICAL: For validation, temporarily set to None (all experts)
+        # even if we're in sequential training mode
         if active_expert is not None:
             print(f"   Validating with ONLY expert {active_expert}")
+            # Store the actual active expert but use all for forward pass
+            validation_expert = active_expert
         else:
             print(f"   Validating with ALL experts")
+            validation_expert = None
+        
+        # Always use all experts for validation forward pass
+        model.set_active_expert(None)
     
     total_loss = 0.0
     total_tokens = 0
@@ -297,21 +315,9 @@ def evaluate(model, val_loader, device, config, tokenizer, active_expert=None):
             input_ids = input_ids.to(device, non_blocking=True)
             target_ids = target_ids.to(device, non_blocking=True)
             
-            # 🔥 VISUAL TURKISH SAMPLE: Show human-readable text
-            if i == 0:  # First batch only
-                sample_tokens = input_ids[0].cpu().tolist()
-                # Decode first 30 tokens (skip padding zeros)
-                non_zero_tokens = [t for t in sample_tokens[:30] if t > 0]
-                try:
-                    sample_text = tokenizer.decode(non_zero_tokens)
-                    # Truncate if too long
-                    if len(sample_text) > 60:
-                        sample_text = sample_text[:57] + "..."
-                    print(f"\n📝 Örnek Turkce metin: '{sample_text}'")
-                except Exception as e:
-                    print(f"\n⚠️ Decode failed: {e}\n   Tokens: {non_zero_tokens[:10]}...")
-            
-            with torch.amp.autocast(device_type='cuda', enabled=(val_dtype == 'bf16')):
+            # CRITICAL: Use proper autocast settings based on dtype
+            use_autocast = val_dtype in ['bf16', 'fp16']
+            with torch.amp.autocast(device_type='cuda', enabled=use_autocast, dtype=torch.bfloat16 if val_dtype == 'bf16' else torch.float16):
                 output = model(input_ids, start_pos=0)
                 logits = output[0] if isinstance(output, tuple) else output
                 
@@ -328,6 +334,16 @@ def evaluate(model, val_loader, device, config, tokenizer, active_expert=None):
             pbar.set_postfix({'loss': f'{loss.item():.3f}'})
     
     pbar.close()
+    
+    # CRITICAL: Restore original gradient requirements
+    for name, param in model.named_parameters():
+        if name in original_expert_grads:
+            param.requires_grad = original_expert_grads[name]
+    
+    # Restore the active expert if in sequential training mode
+    if hasattr(model, 'set_active_expert') and 'validation_expert' in locals():
+        model.set_active_expert(validation_expert)
+    
     model.train()
     
     final_loss = total_loss / total_tokens
@@ -338,7 +354,6 @@ def evaluate(model, val_loader, device, config, tokenizer, active_expert=None):
         print(f"   Loss std dev: {loss_std:.6f} (should be >0.01)")
     
     return final_loss
-
 
 def save_checkpoint(model, optimizer, step, config, expert_idx=None):
     """Save model checkpoint"""
@@ -392,7 +407,11 @@ def train_step(model, input_mb, target_mb, device, config, scaler=None):
     input_mb = input_mb.to(device, non_blocking=True)
     target_mb = target_mb.to(device, non_blocking=True)
 
-    with torch.amp.autocast(device_type='cuda', enabled=(config["training"]["dtype"] == "bf16")):
+    training_dtype = config["training"]["dtype"].lower()
+    use_autocast = training_dtype in ['bf16', 'fp16']
+    autocast_dtype = torch.bfloat16 if training_dtype == 'bf16' else torch.float16
+    with torch.amp.autocast(device_type='cuda', enabled=use_autocast, dtype=autocast_dtype if use_autocast else None):
+
         output = model(input_mb, start_pos=0)
         
         if isinstance(output, tuple):
