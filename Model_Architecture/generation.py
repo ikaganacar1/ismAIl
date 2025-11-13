@@ -171,12 +171,53 @@ def get_tokenizer(use_turkish=False, tokenizer_name="gpt2"):
 # EXAMPLE USAGE
 #####################################
 
+def load_checkpoint(model, checkpoint_path):
+    """
+    Load a trained checkpoint into the model.
+
+    Args:
+        model: The model instance
+        checkpoint_path: Path to the checkpoint file (.pt)
+
+    Returns:
+        The loaded checkpoint dictionary with metadata
+    """
+    print(f"\n📦 Loading checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+    # Handle different checkpoint formats
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"✅ Loaded model state from checkpoint")
+        if 'step' in checkpoint:
+            print(f"   Training step: {checkpoint['step']:,}")
+        if 'loss' in checkpoint:
+            print(f"   Loss: {checkpoint['loss']:.4f}")
+    else:
+        # Direct state dict
+        model.load_state_dict(checkpoint)
+        print(f"✅ Loaded model state (direct)")
+
+    return checkpoint
+
+
 if __name__ == "__main__":
     import json
     from pathlib import Path
+    import sys
 
     # Configuration: Set to True to use Turkish tokenizer, False for tiktoken
     USE_TURKISH_TOKENIZER = True  # Change this to False for English text generation
+
+    # ===== CHECKPOINT LOADING =====
+    # Set this to the path of your trained checkpoint
+    # Example: CHECKPOINT_PATH = "./checkpoints/step_55000_expert_2.pt"
+    CHECKPOINT_PATH = None  # Set to None to use random initialization
+
+    # You can also pass checkpoint path as command line argument
+    if len(sys.argv) > 1:
+        CHECKPOINT_PATH = sys.argv[1]
+        print(f"🔧 Using checkpoint from command line: {CHECKPOINT_PATH}")
 
     # Example configuration - smaller model for testing
     config_path = Path("config.json")
@@ -207,9 +248,21 @@ if __name__ == "__main__":
             print(f"📊 Updated vocab_size to {args.vocab_size:,} for Turkish tokenizer")
 
     # Initialize model
-    print("Initializing model...")
+    print("\n🚀 Initializing model...")
     torch.manual_seed(123)
     model = ismail(args)
+
+    # Load checkpoint if specified
+    if CHECKPOINT_PATH:
+        checkpoint_file = Path(CHECKPOINT_PATH)
+        if checkpoint_file.exists():
+            load_checkpoint(model, checkpoint_file)
+        else:
+            print(f"❌ Checkpoint not found: {CHECKPOINT_PATH}")
+            print("   Using random initialization instead")
+    else:
+        print("ℹ️  No checkpoint specified, using random initialization")
+
     model.eval()
 
     # Example 1: Greedy generation (argmax)
