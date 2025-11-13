@@ -15,8 +15,8 @@ import json
 # Configuration
 SMALL_DATA = True  # set to False to use the full dataset
 DEFAULT_DATA_DIR = Path(__file__).parent  # Save to Model_Architecture/data/
-DATASET_NAME = "uonlp/CulturaX"  # HuggingFace dataset
-SUBSET = "tr"  # Turkish subset
+DATASET_NAME = "vngrs-ai/vngrs-web-corpus"  # HuggingFace dataset
+SUBSET = None  # No subset needed for this dataset
 
 
 def download_and_prepare_data(
@@ -84,14 +84,22 @@ def download_and_prepare_data(
             else:
                 # No cached files found, use streaming
                 print(f"   No cached files found. Using streaming mode...")
-                print(f"   Downloading from HuggingFace: {DATASET_NAME}/{SUBSET}")
+                dataset_desc = f"{DATASET_NAME}/{SUBSET}" if SUBSET else DATASET_NAME
+                print(f"   Downloading from HuggingFace: {dataset_desc}")
 
-                dataset = load_dataset(
-                    DATASET_NAME,
-                    SUBSET,
-                    split="train",
-                    streaming=True,
-                )
+                if SUBSET:
+                    dataset = load_dataset(
+                        DATASET_NAME,
+                        SUBSET,
+                        split="train",
+                        streaming=True,
+                    )
+                else:
+                    dataset = load_dataset(
+                        DATASET_NAME,
+                        split="train",
+                        streaming=True,
+                    )
 
                 # Take limited number of samples from stream
                 num_samples = max_samples if max_samples else 100_000
@@ -111,7 +119,10 @@ def download_and_prepare_data(
             dataset = load_dataset('parquet', data_files=full_data_path)
         else:
             # Download full dataset from HuggingFace
-            dataset = load_dataset(DATASET_NAME, SUBSET, split="train")
+            if SUBSET:
+                dataset = load_dataset(DATASET_NAME, SUBSET, split="train")
+            else:
+                dataset = load_dataset(DATASET_NAME, split="train")
             dataset = DatasetDict({"train": dataset})
 
     print(f"✅ Dataset loaded: {len(dataset['train']):,} documents")
