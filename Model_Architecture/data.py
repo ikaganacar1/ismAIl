@@ -336,7 +336,7 @@ def create_dataloader(
         prefetch_factor=2 if num_workers > 0 else None,
     )
 
-    return dataloader
+    return dataloader, tokenizer
 
 
 # Convenience function for downloading sample data

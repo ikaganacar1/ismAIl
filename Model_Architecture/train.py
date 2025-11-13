@@ -1,4 +1,3 @@
-
 import argparse
 import torch
 
@@ -216,54 +215,80 @@ def get_lr(step, config):
 
 
 def load_data(config):
-    """Create data loaders with memory-efficient loading"""
+    from data import create_dataloader
+
     data_cfg = config["data"]
 
     print("\n" + "="*70)
     print("DATA LOADING")
     print("="*70 + "\n")
 
-    from data import create_dataloader
+    from model import ModelArgs
+    
 
-    # FIXED: Pass file path directly instead of reading entire file into memory
-    # The create_dataloader will use MemoryEfficientTextDataset for lazy loading
-    train_loader = create_dataloader(
-        txt=str(data_cfg["train_file"]),  # Pass path, not file contents
-        args=ModelArgs(**config["model"]),
+    args = ModelArgs(**config["model"])
+
+    train_loader, tokenizer = create_dataloader(
+        txt=str(data_cfg["train_file"]),
+        use_turkish_tokenizer=True,  
+        args=args,
         stride=data_cfg["stride"],
         shuffle=True,
         drop_last=True,
-        use_memory_efficient=True,  # Use memory-efficient loading
+        use_memory_efficient=True,
+        is_val=False
     )
 
-    val_loader = create_dataloader(
-        txt=str(data_cfg["val_file"]),  # Pass path, not file contents
-        args=ModelArgs(**config["model"]),
+    val_loader, tokenizer = create_dataloader(
+        txt=str(data_cfg["val_file"]),
+        use_turkish_tokenizer=True, 
+        args=args,
         stride=data_cfg["stride"],
         shuffle=False,
         drop_last=True,
-        use_memory_efficient=True,  # Use memory-efficient loading
-        is_val = True 
+        use_memory_efficient=True,
+        is_val=True
     )
 
     print(f"✅ Train batches: {len(train_loader)}")
     print(f"✅ Val batches: {len(val_loader)}\n")
 
-    return train_loader, val_loader
+    return train_loader, val_loader, tokenizer  # Return tokenizer
 
-
-def evaluate(model, val_loader, device, config):
-    """Evaluate model on validation set"""
+def evaluate(model, val_loader, device, config, tokenizer, active_expert=None):
+    """Evaluate model on validation set
+    
+    Args:
+        active_expert: If not None, only evaluate with this expert active
+                      (useful for sequential training to see individual expert progress)
+    """
     model.eval()
+    
+    # Clear caches...
+    for layer in model.layers:
+        if hasattr(layer.attn, 'kv_cache'):
+            layer.attn.kv_cache.zero_()
+        if hasattr(layer.attn, 'pe_cache'):
+            layer.attn.pe_cache.zero_()
+    
+    # Set expert mode for validation
+    if hasattr(model, 'set_active_expert'):
+        model.set_active_expert(active_expert)
+        if active_expert is not None:
+            print(f"   Validating with ONLY expert {active_expert}")
+        else:
+            print(f"   Validating with ALL experts")
+    
     total_loss = 0.0
     total_tokens = 0
-    max_batches = config["training"].get("max_val_batches", 50)  # Only 50 batches
+    max_batches = config["training"].get("max_val_batches", 200)
     
-    # Add progress bar
     from tqdm import tqdm
     pbar = tqdm(total=max_batches, desc="📊 Validating", ncols=80)
     
     val_dtype = config["training"]["dtype"]
+    batch_losses = []
+    
     with torch.no_grad():
         for i, (input_ids, target_ids) in enumerate(val_loader):
             if i >= max_batches:
@@ -272,7 +297,20 @@ def evaluate(model, val_loader, device, config):
             input_ids = input_ids.to(device, non_blocking=True)
             target_ids = target_ids.to(device, non_blocking=True)
             
-            # Use autocast for speed
+            # 🔥 VISUAL TURKISH SAMPLE: Show human-readable text
+            if i == 0:  # First batch only
+                sample_tokens = input_ids[0].cpu().tolist()
+                # Decode first 30 tokens (skip padding zeros)
+                non_zero_tokens = [t for t in sample_tokens[:30] if t > 0]
+                try:
+                    sample_text = tokenizer.decode(non_zero_tokens)
+                    # Truncate if too long
+                    if len(sample_text) > 60:
+                        sample_text = sample_text[:57] + "..."
+                    print(f"\n📝 Örnek Turkce metin: '{sample_text}'")
+                except Exception as e:
+                    print(f"\n⚠️ Decode failed: {e}\n   Tokens: {non_zero_tokens[:10]}...")
+            
             with torch.amp.autocast(device_type='cuda', enabled=(val_dtype == 'bf16')):
                 output = model(input_ids, start_pos=0)
                 logits = output[0] if isinstance(output, tuple) else output
@@ -283,6 +321,7 @@ def evaluate(model, val_loader, device, config):
                     ignore_index=-1,
                 )
             
+            batch_losses.append(loss.item())
             total_loss += loss.item() * target_ids.numel()
             total_tokens += target_ids.numel()
             pbar.update(1)
@@ -290,7 +329,15 @@ def evaluate(model, val_loader, device, config):
     
     pbar.close()
     model.train()
-    return total_loss / total_tokens
+    
+    final_loss = total_loss / total_tokens
+    
+    # Show loss variation stats
+    if len(batch_losses) > 1:
+        loss_std = torch.std(torch.tensor(batch_losses)).item()
+        print(f"   Loss std dev: {loss_std:.6f} (should be >0.01)")
+    
+    return final_loss
 
 
 def save_checkpoint(model, optimizer, step, config, expert_idx=None):
@@ -410,7 +457,7 @@ def main():
     optimizer = setup_optimizer(model, config)
     
     # Data setup
-    train_loader, val_loader = load_data(config)
+    train_loader, val_loader, tokenizer = load_data(config)
     train_iter = iter(train_loader)
     
     # Training state
@@ -465,8 +512,16 @@ def main():
     # Expert rotation
     current_expert = 0
     rotation_steps = config["training"]["expert_rotation_steps"]
-    model.set_active_expert(current_expert)
-    print(f"🎯 Training expert {current_expert}/{model_args.n_routed_experts - 1}")
+    
+    # Check if we should train all experts simultaneously
+    train_all_experts = config["training"].get("train_all_experts", False)
+    
+    if train_all_experts:
+        print("🎯 Training ALL experts simultaneously\n")
+        model.set_active_expert(None)  # None = all experts active
+    else:
+        print(f"🎯 Training expert {current_expert}/{model_args.n_routed_experts - 1} (sequential mode)\n")
+        model.set_active_expert(current_expert)
     
     # Define variables
     accum_steps = config["training"]["gradient_accumulation_steps"]
@@ -483,8 +538,8 @@ def main():
     while step < total_steps:
         step_start = time.time()
         
-        # Expert rotation
-        if step > 0 and step % rotation_steps == 0:
+        # Expert rotation (only in sequential mode)
+        if not train_all_experts and step > 0 and step % rotation_steps == 0:
             current_expert = (current_expert + 1) % model_args.n_routed_experts
             model.set_active_expert(current_expert)
             print(f"\n🔄 Rotating to expert {current_expert}/{model_args.n_routed_experts - 1}")
@@ -577,15 +632,38 @@ def main():
         # Evaluation
         if step % config["training"]["eval_every"] == 0 and step > 0:
             print(f"\n📊 Evaluating at step {step}...")
-            val_loss = evaluate(model, val_loader, device, config)
-            print(f"Val Loss: {val_loss:.4f} | Perplexity: {math.exp(val_loss):.2f}\n")
             
-            if config["logging"]["use_wandb"] and HAS_WANDB:
-                wandb.log({"val_loss": val_loss, "val_perplexity": math.exp(val_loss)})
-            
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                save_checkpoint(model, optimizer, step, config, expert_idx="best")
+            if train_all_experts:
+                # In all-experts mode, just validate with all experts
+                val_loss = evaluate(model, val_loader, device, config, tokenizer, active_expert=None)
+                print(f"Val Loss: {val_loss:.4f} | Perplexity: {math.exp(val_loss):.2f}\n")
+                
+                if config["logging"]["use_wandb"] and HAS_WANDB:
+                    wandb.log({"val_loss": val_loss, "val_perplexity": math.exp(val_loss)})
+                
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    save_checkpoint(model, optimizer, step, config, expert_idx="best")
+            else:
+                # In sequential mode, validate both per-expert and all-experts
+                val_loss_active = evaluate(model, val_loader, device, config, tokenizer, active_expert=current_expert)
+                print(f"Val Loss (Expert {current_expert}): {val_loss_active:.4f} | Perplexity: {math.exp(val_loss_active):.2f}")
+                
+                val_loss_all = evaluate(model, val_loader, device, config, tokenizer, active_expert=None)
+                print(f"Val Loss (All Experts): {val_loss_all:.4f} | Perplexity: {math.exp(val_loss_all):.2f}\n")
+                
+                if config["logging"]["use_wandb"] and HAS_WANDB:
+                    wandb.log({
+                        f"val_loss_expert_{current_expert}": val_loss_active, 
+                        f"val_perplexity_expert_{current_expert}": math.exp(val_loss_active),
+                        "val_loss_all_experts": val_loss_all,
+                        "val_perplexity_all_experts": math.exp(val_loss_all)
+                    })
+                
+                # Save best based on active expert performance
+                if val_loss_active < best_val_loss:
+                    best_val_loss = val_loss_active
+                    save_checkpoint(model, optimizer, step, config, expert_idx="best")
         
         # Save checkpoint
         if step % config["training"]["save_every"] == 0 and step > 0:
@@ -606,7 +684,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
-    
-    
-    

@@ -47,7 +47,8 @@
         "dtype": "fp32",
         "compile": false,
         "max_val_batches": 50,
-        "val_batch_size_multiplier": 4
+        "val_batch_size_multiplier": 4,
+        "train_all_experts":false
     },
     "data": {
         "train_file": "./data/train.txt",

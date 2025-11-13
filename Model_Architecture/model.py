@@ -395,15 +395,10 @@ class MoE(nn.Module):
         original_shape = x.size()
         x = x.view(-1, self.dim)
 
-        # Compute routing
-        router_logits = F.linear(x, self.gate.weight)
+        router_logits = F.linear(x, self.gate.weight, self.gate.bias)  # Use bias directly
         router_probs = router_logits.sigmoid()
-
-        if self.gate.bias is not None:
-            router_logits = router_logits + self.gate.bias
-
-        # Select top-k experts
         weights, indices = torch.topk(router_probs, self.n_activated_experts, dim=-1)
+        
 
         # Normalize weights
         weights = weights / weights.sum(dim=-1, keepdim=True)
@@ -541,6 +536,13 @@ class ismail(nn.Module):
         h = self.tok_embeddings(tokens).to(Linear.dtype)
         freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
 
+        if start_pos == 0:
+            for layer in self.layers:
+                if hasattr(layer.attn, 'kv_cache'):
+                    layer.attn.kv_cache.zero_()
+                if hasattr(layer.attn, 'pe_cache'):
+                    layer.attn.pe_cache.zero_()
+
         mask = None
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
@@ -549,7 +551,6 @@ class ismail(nn.Module):
 
         total_lb_loss = 0.0
         
-        # ✅ SIMPLE forward pass - no checkpointing
         for layer in self.layers:
             h, lb_loss = layer(h, start_pos, freqs_cis, mask)
             if lb_loss is not None:
