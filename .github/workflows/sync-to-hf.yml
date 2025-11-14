@@ -23,7 +23,7 @@ jobs:
           git config --global user.name "github-actions[bot]"
           
           # Add Hugging Face remote
-          git remote add hf https://user:${HF_TOKEN}@huggingface.co/spaces/ikaganacar/ismail
+          git remote add hf https://user:${HF_TOKEN}@huggingface.co/ikaganacar/ismail
           
           # Push to Hugging Face
           git push hf main --force
