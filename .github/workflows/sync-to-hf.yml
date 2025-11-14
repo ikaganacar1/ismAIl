@@ -1,0 +1,29 @@
+name: Sync to Hugging Face
+
+on:
+  push:
+    branches:
+      - main  # Change to 'master' if that's your default branch
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Fetch all history for proper syncing
+          lfs: true       # Enable Git LFS if you have large files
+
+      - name: Push to Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          
+          # Add Hugging Face remote
+          git remote add hf https://user:${HF_TOKEN}@huggingface.co/spaces/ikaganacar/ismail
+          
+          # Push to Hugging Face
+          git push hf main --force
